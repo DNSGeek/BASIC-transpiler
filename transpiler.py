@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 """
 py2basic - Python to Commodore BASIC Transpiler
 ================================================
@@ -465,9 +463,19 @@ class Transpiler(ast.NodeVisitor):
             return self._basic_var(node.id, node)
 
         if isinstance(node, ast.BinOp):
+            op = node.op
+            # String % formatting: "Hello %s" % name  or  "Hi %s %s" % (a, b)
+            # Must check before evaluating left/right so we can inspect AST types.
+            if (
+                isinstance(op, ast.Mod)
+                and isinstance(node.left, ast.Constant)
+                and isinstance(node.left.value, str)
+            ):
+                return self._expand_percent_format(
+                    node.left.value, node.right, getattr(node, "lineno", 0)
+                )
             left = self._expr(node.left)
             right = self._expr(node.right)
-            op = node.op
             if isinstance(op, ast.Add):
                 return f"{left} + {right}"
             if isinstance(op, ast.Sub):
@@ -541,9 +549,151 @@ class Transpiler(ast.NodeVisitor):
                 "Ternary expressions not supported.", getattr(node, "lineno", 0)
             )
 
+        if isinstance(node, ast.JoinedStr):
+            return self._expand_fstring(node)
+
         raise TranspilerError(
             f"Unsupported expression: {type(node).__name__}", getattr(node, "lineno", 0)
         )
+
+    def _expand_percent_format(self, fmt: str, args_node, lineno: int) -> str:
+        """
+        Expand Python % string formatting into BASIC string concatenation.
+        "Hello %s, you are %d" % (name, age)
+        -> "Hello " + A$ + ", you are " + STR$(B) (joined with ; in PRINT context)
+
+        Supported: %s, %d, %i, %f, %g  (all become STR$() for numeric, direct for strings)
+        Not supported: width/precision specifiers like %-10s, %05d, etc.
+        """
+        import re
+
+        # Collect the argument nodes into a list
+        if isinstance(args_node, ast.Tuple):
+            arg_nodes = list(args_node.elts)
+        else:
+            arg_nodes = [args_node]
+
+        # Split format string on % specifiers
+        # Matches %s, %d, %i, %f, %g, %r (basic ones without width/precision)
+        parts = re.split(r"(%[sdifrg])", fmt)
+
+        result_parts = []
+        arg_index = 0
+
+        for part in parts:
+            if re.match(r"^%[sdifrg]$", part):
+                # A format specifier — consume next argument
+                if arg_index >= len(arg_nodes):
+                    raise TranspilerError(
+                        f"Too few arguments for format string '{fmt}'", lineno
+                    )
+                arg_node = arg_nodes[arg_index]
+                arg_index += 1
+                spec = part[1]  # the letter after %
+
+                if spec == "s":
+                    # String: if already a string type, use directly; else STR$()
+                    is_str = (
+                        isinstance(arg_node, ast.Constant)
+                        and isinstance(arg_node.value, str)
+                    ) or (
+                        isinstance(arg_node, ast.Name)
+                        and arg_node.id in self._string_vars
+                    )
+                    if is_str:
+                        result_parts.append(self._expr(arg_node))
+                    else:
+                        result_parts.append(f"STR$({self._expr(arg_node)})")
+                else:
+                    # Numeric (%d, %i, %f, %g): use STR$() to convert to string
+                    if spec in ("d", "i"):
+                        result_parts.append(f"STR$(INT({self._expr(arg_node)}))")
+                    else:
+                        result_parts.append(f"STR$({self._expr(arg_node)})")
+            elif part == "%%":
+                result_parts.append('"%"')
+            elif part:
+                # Literal string segment — wrap in quotes (strip any embedded quotes)
+                result_parts.append(f'"{part.replace(chr(34), "")}"')
+
+        if arg_index < len(arg_nodes):
+            raise TranspilerError(
+                f"Too many arguments for format string '{fmt}'", lineno
+            )
+
+        if not result_parts:
+            return '""'
+
+        return " + ".join(result_parts)
+
+    def _expand_fstring(self, node) -> str:
+        """
+        Expand an f-string (JoinedStr) into BASIC string concatenation.
+
+        f"Hello {name}, age {age}"
+        -> "Hello " + A$ + ", age " + STR$(A)
+
+        Supported:
+          {expr}        plain expression
+          {expr!s}      str() conversion — same as plain for us
+          {expr!r}      repr() — treated same as str(), no quotes added
+        Not supported:
+          {expr:.2f}    format specs — rejected with helpful error
+          {expr!a}      ascii conversion
+        """
+        lineno = getattr(node, "lineno", 0)
+        parts = []
+
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                # Literal string segment
+                if value.value:
+                    parts.append(f'"{value.value.replace(chr(34), "")}"')
+            elif isinstance(value, ast.FormattedValue):
+                # Check for unsupported format specs
+                if value.format_spec is not None:
+                    raise TranspilerError(
+                        "f-string format specs (e.g. {x:.2f}) are not supported. "
+                        "Use str() or int() to convert manually.",
+                        lineno,
+                    )
+                # !a conversion not supported
+                if value.conversion == 97:  # 'a'
+                    raise TranspilerError(
+                        "f-string !a conversion not supported.", lineno
+                    )
+
+                expr = self._expr(value.value)
+
+                # Determine if the expression is already a string
+                is_str = (
+                    (
+                        isinstance(value.value, ast.Constant)
+                        and isinstance(value.value.value, str)
+                    )
+                    or (
+                        isinstance(value.value, ast.Name)
+                        and value.value.id in self._string_vars
+                    )
+                    or (
+                        isinstance(value.value, ast.Call)
+                        and isinstance(value.value.func, ast.Name)
+                        and value.value.func.id in {"str", "chr", "input"}
+                    )
+                )
+
+                if is_str:
+                    parts.append(expr)
+                else:
+                    parts.append(f"STR$({expr})")
+            else:
+                raise TranspilerError(
+                    f"Unsupported f-string component: {type(value).__name__}", lineno
+                )
+
+        if not parts:
+            return '""'
+        return " + ".join(parts)
 
     def _call_expr(self, node):
         lineno = getattr(node, "lineno", 0)
@@ -634,18 +784,17 @@ class Transpiler(ast.NodeVisitor):
             # END separates main code from subroutines below it - no GOTO needed
             self._emit("END")
 
-            # Assign real line numbers to subroutines (after all main code)
-            for name in func_names:
-                self._functions[name] = self.lines.next()
+            # Emit each subroutine completely before moving to the next,
+            # assigning its line number immediately before emitting its body.
+            # This prevents interleaving when multiple functions are defined.
+            for stmt in node.body:
+                if isinstance(stmt, ast.FunctionDef):
+                    self._functions[stmt.name] = self.lines.next()
+                    self.visit(stmt)
 
             # Backfill all GOSUB placeholders now that line numbers are known
             for gosub_ln, func_name in self._gosub_backfills:
                 self.emitter.emit(gosub_ln, f"GOSUB {self._functions[func_name]}")
-
-            # Emit subroutine bodies
-            for stmt in node.body:
-                if isinstance(stmt, ast.FunctionDef):
-                    self.visit(stmt)
 
     def visit_FunctionDef(self, node):
         lineno = node.lineno
@@ -665,7 +814,10 @@ class Transpiler(ast.NodeVisitor):
             self.visit(stmt)
         self._in_function = False
 
-        self._emit("RETURN")
+        # Only emit trailing RETURN if the function doesn't already end with one
+        last_stmt = node.body[-1] if node.body else None
+        if not isinstance(last_stmt, ast.Return):
+            self._emit("RETURN")
 
     def visit_Return(self, node):
         if node.value is not None:

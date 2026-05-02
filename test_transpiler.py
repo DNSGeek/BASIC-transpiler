@@ -274,6 +274,37 @@ test7("for loop", "for i in range(5):\n print(i)", ["FOR", "= 0 TO 4", "NEXT"])
 test7("function", "def f():\n print('hi')\nf()", ["GOSUB", "RETURN"])
 test7("fizzbuzz", FIZZBUZZ, ["DO", "LOOP WHILE", "BEGIN", "BEND"])
 
+
+# % string formatting
+test("percent %s", 'name="Tom"\nprint("Hi %s" % name)', ['"Hi " + A$'], basic65=False)
+test("percent %d", 'print("Age %d" % 30)', ["STR$(INT(30))"], basic65=False)
+test(
+    "percent multi",
+    'name="Tom"\nage=30\nprint("Hi %s age %d" % (name, age))',
+    ['"Hi " + A$', "STR$(INT(A))"],
+    basic65=False,
+)
+test("percent numeric as str", 'x=42\nprint("val %s" % x)', ["STR$("], basic65=False)
+
+
+# f-string support
+test(
+    "fstring str var", 'name="Tom"\nprint(f"Hi {name}")', ['"Hi " + A$'], basic65=False
+)
+test("fstring numeric", 'age=30\nprint(f"Age {age}")', ["STR$(A)"], basic65=False)
+test(
+    "fstring mixed",
+    'name="Tom"\nage=30\nprint(f"Hi {name} age {age}")',
+    ['"Hi " + A$', "STR$(A)"],
+    basic65=False,
+)
+test("fstring no vars", 'print(f"Hello there")', ['"Hello there"'], basic65=False)
+test(
+    "fstring format spec rejected",
+    'x=3.14\nprint(f"{x:.2f}")',
+    should_fail=True,
+    basic65=False,
+)
 print(f"\n{'=' * 50}")
 print(f"Results: {PASS} passed, {FAIL} failed")
 if FAIL:
