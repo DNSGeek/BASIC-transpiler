@@ -1,9 +1,9 @@
-# py2basic65 — Python to MEGA65 BASIC 65 Transpiler
+# py2basic — Python to BASIC Transpiler
 
-Transpiles a constrained subset of Python into MEGA65 BASIC 65 source code.
+Transpiles a constrained subset of Python into Commodore BASIC source code.
 
 Write simple programs in Python (with modern tooling, syntax highlighting,
-and sane variable names), then run them on your MEGA65.
+and sane variable names), then run them on your system.
 
 Inspired by the idea that you shouldn't have to think in line numbers.
 
