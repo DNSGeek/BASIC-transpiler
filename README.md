@@ -7,6 +7,8 @@ and sane variable names), then run them on your MEGA65.
 
 Inspired by the idea that you shouldn't have to think in line numbers.
 
+Capable of generating BASIC 2.0 (Commodore 64 - the default), BASIC 7.0 (Commodore 128) and BASIC65 (MEGA65) dialetcs of BASIC.
+
 ## Requirements
 
 - Python 3.8+
@@ -29,13 +31,11 @@ chmod +x transpiler.py
 
 ```bash
 python3 transpiler.py input.py
-python3 transpiler.py input.py -o output.bas
+python3 transpiler.py --basic7 input.py
+python3 transpiler.py --basic65 input.py -o output.bas
 python3 transpiler.py input.py --vars          # show variable name map
 python3 transpiler.py input.py --start 100 --step 10
 ```
-
-Then transfer `output.bas` to your MEGA65 and use `IMPORT "output.bas"` to
-load it as a BASIC program.
 
 ## Supported Python Subset
 
