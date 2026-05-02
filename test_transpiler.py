@@ -12,7 +12,6 @@ from transpiler import (
     Basic2Dialect,
     Basic7Dialect,
     Basic65Dialect,
-    LineAllocator,
     Transpiler,
     TranspilerError,
 )
