@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """
 py2basic - Python to Commodore BASIC Transpiler
 ================================================
@@ -722,6 +724,17 @@ class Transpiler(ast.NodeVisitor):
     def visit_Expr(self, node):
         if isinstance(node.value, ast.Call):
             self._compile_call_stmt(node.value)
+        elif isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            # Docstrings and bare string literals — treat as REM comments.
+            # Take only the first line since BASIC lines can't span multiple lines.
+            first_line = (
+                node.value.value.strip().splitlines()[0]
+                if node.value.value.strip()
+                else ""
+            )
+            if first_line:
+                self._emit(f"REM {first_line}")
+            # else: empty docstring, emit nothing
         else:
             raise TranspilerError(
                 f"Bare expression not supported: {ast.dump(node.value)}", node.lineno
