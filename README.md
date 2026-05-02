@@ -40,6 +40,7 @@ load it as a BASIC program.
 ## Supported Python Subset
 
 ### Variables
+
 ```python
 x = 42          # numeric variable
 name = "hello"  # string variable (type inferred from assignment)
@@ -47,6 +48,7 @@ x = 3.14        # float
 ```
 
 ### Output / Input
+
 ```python
 print("hello")           # -> PRINT "HELLO"
 print(x, y)              # -> PRINT X ; Y
@@ -55,6 +57,7 @@ name = input("Name? ")   # -> PRINT "Name? " : INPUT A$
 ```
 
 ### Math operators
+
 ```python
 x + y    # addition
 x - y    # subtraction
@@ -66,6 +69,7 @@ x // y   # floor div -> INT(X / Y)
 ```
 
 ### Augmented assignment
+
 ```python
 x += 1   # -> X = X + 1
 x -= 1   # -> X = X - 1
@@ -74,6 +78,7 @@ x %= 3   # -> X = MOD(X, 3)
 ```
 
 ### Comparison and logical operators
+
 ```python
 x == y   # =
 x != y   # <>
@@ -87,6 +92,7 @@ not a    # NOT
 ```
 
 ### Control flow
+
 ```python
 if x > 0:          # IF X > 0 THEN BEGIN
     print("pos")   #   PRINT "POS"
@@ -118,6 +124,7 @@ break   # EXIT  (exits a DO/LOOP)
 ```
 
 ### Functions (subroutines)
+
 ```python
 def greet():        # REM -- greet (at reserved line)
     print("hello")  # PRINT "HELLO"
@@ -130,6 +137,7 @@ Functions **cannot** have parameters or return values. Use global variables
 to pass data between subroutines — exactly as you would in BASIC.
 
 ### Built-in functions
+
 ```python
 int(x)      # INT(X)
 str(x)      # STR$(X)
@@ -141,6 +149,7 @@ round(x)    # INT(X + 0.5)
 ```
 
 ### Standard library (limited)
+
 ```python
 import time
 time.sleep(1.5)   # SLEEP 1.5
@@ -150,11 +159,13 @@ sys.exit()        # END
 ```
 
 ### Comments
+
 ```python
 # This becomes a REM statement
 ```
 
 ### assert
+
 ```python
 assert x > 0           # IF NOT (X > 0) THEN BEGIN : PRINT "Assertion failed" : END : BEND
 assert x > 0, "bad x"  # IF NOT (X > 0) THEN BEGIN : PRINT "BAD X" : END : BEND
@@ -165,12 +176,12 @@ assert x > 0, "bad x"  # IF NOT (X > 0) THEN BEGIN : PRINT "BAD X" : END : BEND
 BASIC 65 variable names are very short (single letter, or letter+digit).
 The transpiler maintains a symbol table that maps Python names to BASIC names:
 
-| Python name   | BASIC 65 name |
-|---------------|---------------|
-| `counter`     | `A`           |
-| `total`       | `B`           |
-| `name`        | `A$`          |
-| `greeting`    | `B$`          |
+| Python name | BASIC 65 name |
+| ----------- | ------------- |
+| `counter`   | `A`           |
+| `total`     | `B`           |
+| `name`      | `A$`          |
+| `greeting`  | `B$`          |
 
 Use `--vars` to see the full mapping:
 
@@ -210,6 +221,7 @@ The transpiler will give you a clear error message for any of these:
 ## Example
 
 Input (`fizzbuzz.py`):
+
 ```python
 i = 1
 while i <= 20:
@@ -227,6 +239,7 @@ while i <= 20:
 ```
 
 Output:
+
 ```
 10 A = 1
 20 DO
