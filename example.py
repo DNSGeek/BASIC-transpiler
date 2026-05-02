@@ -9,14 +9,14 @@ pi_approx = 355 / 113
 radius = 5
 area = pi_approx * radius * radius
 
-print("CIRCLE AREA CALCULATOR")
+print('CIRCLE "AREA" CALCULATOR')
 print("RADIUS =")
 print(radius)
 print("AREA =")
 print(area)
 
 # ── String handling ────────────────────────────────────────────────────────────
-greeting = "HELLO FROM MEGA65"
+greeting = "HELLO FROM The Python Transpiler."
 print(greeting)
 print(len(greeting))
 
@@ -49,7 +49,7 @@ else:
 # ── Subroutine (no params, no return) ─────────────────────────────────────────
 def banner():
     print("==================")
-    print("  PY2BASIC65 DEMO")
+    print("   PY2BASIC DEMO  ")
     print("==================")
 
 

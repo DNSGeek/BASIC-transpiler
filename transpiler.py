@@ -441,6 +441,31 @@ class Transpiler(ast.NodeVisitor):
             return self.sym.get_string(py_name)
         return self.sym.get_numeric(py_name)
 
+    def _escape_commodore_string(self, s: str) -> str:
+        """
+        Convert a Python string containing double quotes into a BASIC
+        string expression using CHR$(34) for the quotes.
+
+        Returns a complete BASIC expression (not just the inner part),
+        so callers must NOT wrap it in additional quotes.
+
+        Examples:
+          'hello'          -> '"hello"'
+          'say "hi"'       -> '"say " + CHR$(34) + "hi" + CHR$(34)'
+          '"quoted"'       -> 'CHR$(34) + "quoted" + CHR$(34)'
+        """
+        if '"' not in s:
+            return f'"{s}"'
+        # Split on embedded quotes, filter empty segments, join with CHR$(34)
+        segments = s.split('"')
+        parts = []
+        for i, seg in enumerate(segments):
+            if seg:
+                parts.append(f'"{seg}"')
+            if i < len(segments) - 1:
+                parts.append("CHR$(34)")
+        return " + ".join(parts) if parts else '""'
+
     # ── Expression compiler ────────────────────────────────────────────────────
 
     def _expr(self, node):
@@ -450,7 +475,7 @@ class Transpiler(ast.NodeVisitor):
             if isinstance(node.value, (int, float)):
                 return str(node.value)
             if isinstance(node.value, str):
-                return f'"{node.value.replace(chr(34), "")}"'
+                return self._escape_commodore_string(node.value)
             raise TranspilerError(
                 f"Unsupported constant: {type(node.value)}", getattr(node, "lineno", 0)
             )
@@ -613,8 +638,7 @@ class Transpiler(ast.NodeVisitor):
             elif part == "%%":
                 result_parts.append('"%"')
             elif part:
-                # Literal string segment — wrap in quotes (strip any embedded quotes)
-                result_parts.append(f'"{part.replace(chr(34), "")}"')
+                result_parts.append(self._escape_commodore_string(part))
 
         if arg_index < len(arg_nodes):
             raise TranspilerError(
@@ -648,7 +672,7 @@ class Transpiler(ast.NodeVisitor):
             if isinstance(value, ast.Constant) and isinstance(value.value, str):
                 # Literal string segment
                 if value.value:
-                    parts.append(f'"{value.value.replace(chr(34), "")}"')
+                    parts.append(self._escape_commodore_string(value.value))
             elif isinstance(value, ast.FormattedValue):
                 # Check for unsupported format specs
                 if value.format_spec is not None:
