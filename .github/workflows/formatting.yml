@@ -235,17 +235,15 @@ jobs:
         if: steps.find_py.outputs.found == 'true'
         run: |
           python -m pip install --upgrade pip
-          pip install black isort ssort ruff
-
-      - name: Run ruff check (BLOCKING)
-        if: steps.find_py.outputs.found == 'true'
-        run: |
-          echo "Running ruff linter on all Python files..."
-          ruff check .
+          # Pinned: an unpinned `ruff` picks up new default rules on release
+          # and turns a previously green main red with no code change.
+          pip install "black~=26.5" "isort~=8.0" "ssort~=0.17" "ruff~=0.16.4"
 
       - name: Run ssort
         if: steps.find_py.outputs.found == 'true'
-        run: ssort **/*.py || true
+        # Not `ssort **/*.py`: the runner's bash has no globstar, so that
+        # expands to */*.py and silently skips every top-level file.
+        run: xargs ssort < /tmp/py_files.txt || true
 
       - name: Run isort
         if: steps.find_py.outputs.found == 'true'
@@ -255,18 +253,51 @@ jobs:
         if: steps.find_py.outputs.found == 'true'
         run: black .
 
+      # After the formatters, so it lints exactly what gets committed.
+      - name: Run ruff check (BLOCKING)
+        if: steps.find_py.outputs.found == 'true'
+        run: |
+          echo "Running ruff linter on all Python files..."
+          ruff check .
+
+      # ── Tests ────────────────────────────────────────────────────────────────
+
+      - name: Run test suites (BLOCKING)
+        if: steps.find_py.outputs.found == 'true'
+        run: |
+          echo "Running py2basic test suite..."
+          python3 test_transpiler.py
+          echo "Running basic2py test suite..."
+          python3 basic2py/test_basic2py.py
+
       # ── Commit ───────────────────────────────────────────────────────────────
 
       - name: Check for changes
         id: verify_diff
         run: |
-          git diff --quiet . || echo "changed=true" >> "$GITHUB_OUTPUT"
+          # --porcelain also catches files a formatter created, which
+          # `git diff` alone would miss.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
 
+      # Only on `push`. A pull_request build checks out a detached merge
+      # commit, so there is no branch to push to — and a fork PR's token is
+      # read-only, so the push would fail the job outright.
       - name: Commit and push changes
-        if: steps.verify_diff.outputs.changed == 'true'
+        if: github.event_name == 'push' && steps.verify_diff.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "style: auto-format code with shfmt, clang-format, eslint, prettier, markdownlint, vint, black, isort, and ssort"
           git push
+
+      # On a pull request there is nothing to push to, so surface the
+      # formatting drift as a failure instead of silently ignoring it.
+      - name: Fail if a pull request needs formatting
+        if: github.event_name == 'pull_request' && steps.verify_diff.outputs.changed == 'true'
+        run: |
+          echo "::error::This branch is not formatted. Run black, isort and ssort locally."
+          git --no-pager diff
+          exit 1

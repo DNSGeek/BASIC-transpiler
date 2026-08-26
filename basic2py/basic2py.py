@@ -31,11 +31,58 @@ Unresolvable GOTOs are preserved as comments with a TODO marker.
 Variable names are expanded: A->a, A$->a_str, A0->a0, A0$->a0_str
 """
 
+import ast
 import re
 import sys
 import textwrap
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+
+# ── String-literal-aware helpers ───────────────────────────────────────────────
+
+
+def upper_outside_strings(text: str) -> str:
+    """
+    Uppercase BASIC keywords and variable names but leave string literals
+    alone. Uppercasing the whole line destroys the case of anything the
+    program prints.
+    """
+    out = []
+    in_string = False
+    for ch in text:
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+        else:
+            out.append(ch if in_string else ch.upper())
+    return "".join(out)
+
+
+def split_outside_strings(text: str, sep: str) -> list:
+    """Split text on sep, ignoring separators inside string literals."""
+    parts = []
+    current = []
+    in_string = False
+    for ch in text:
+        if ch == '"':
+            in_string = not in_string
+            current.append(ch)
+        elif ch == sep and not in_string:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def sub_outside_strings(pattern, repl, text: str) -> str:
+    """Apply re.sub only to the parts of text outside string literals."""
+    out = []
+    for i, chunk in enumerate(re.split(r'("[^"]*")', text)):
+        # Odd indices are the captured string literals — leave them be.
+        out.append(chunk if i % 2 else re.sub(pattern, repl, chunk))
+    return "".join(out)
+
 
 # ── Data structures ────────────────────────────────────────────────────────────
 
@@ -43,22 +90,8 @@ from typing import Optional
 @dataclass
 class BasicLine:
     number: int
-    text: str  # original statement text (uppercased, stripped)
+    text: str  # statement text, uppercased outside string literals
     original: str  # original as-is
-
-
-@dataclass
-class PyBlock:
-    """A recovered Python code block."""
-
-    lines: list = field(default_factory=list)  # strings
-
-    def add(self, line: str):
-        self.lines.append(line)
-
-    def output(self, indent: int = 0) -> str:
-        prefix = "    " * indent
-        return "\n".join(prefix + l for l in self.lines)
 
 
 # ── Variable name mapper ───────────────────────────────────────────────────────
@@ -93,17 +126,6 @@ class VarMapper:
         self._cache[basic_name] = py_name
         return py_name
 
-    def map_expr(self, expr: str) -> str:
-        """Map all variable references within an expression string."""
-        # Match BASIC variable names: letter optionally followed by digit, optionally followed by $
-        # Must be careful not to match inside function names like STR$, CHR$ etc.
-        # We handle those separately in expression conversion.
-        result = re.sub(r"\b([A-Z][0-9]?)\$", lambda m: self.map(m.group(0)), expr)
-        result = re.sub(
-            r"\b([A-Z][0-9]?)\b(?!\$|\()", lambda m: self.map(m.group(0)), result
-        )
-        return result
-
 
 # ── Expression converter ───────────────────────────────────────────────────────
 
@@ -111,32 +133,40 @@ class VarMapper:
 class ExprConverter:
     """Converts BASIC expressions to Python expressions."""
 
+    #: CHR$(34) — the BASIC idiom for a double quote inside a string.
+    _CHR34 = r"(?:CHR\$|chr)\s*\(\s*34\s*\)"
+
     def __init__(self, var_mapper: VarMapper):
         self.vm = var_mapper
-        self._needs_math = False
-        self._needs_time = False
 
     def _convert_chr34(self, expr: str) -> str:
-        """Convert CHR$(34) concatenation back to quoted strings."""
-        # "hello" + CHR$(34) + "world" -> 'hello"world'
-        # This is cosmetic — leaves as f-string friendly form
+        """
+        Fold CHR$(34) concatenation back into a single Python string literal.
+
+        The quote has to be *escaped* on the way in. Splicing a bare `"` in
+        produces `print("say "hi")`, which is a SyntaxError rather than a
+        program.
+
+          "say " + CHR$(34) + "hi" + CHR$(34)  ->  "say \\"hi\\""
+        """
+        # Between two literals: "a" + CHR$(34) + "b"  ->  "a\"b"
         expr = re.sub(
-            r'"\s*\+\s*(?:CHR\$\s*\(\s*34\s*\)|chr\s*\(\s*34\s*\))\s*\+\s*"',
-            '"',
+            rf'"\s*\+\s*{self._CHR34}\s*\+\s*"',
+            lambda _m: '\\"',
             expr,
             flags=re.IGNORECASE,
         )
-        # Trailing CHR$(34): "hello" + CHR$(34) -> 'hello"'
+        # Trailing: "a" + CHR$(34)  ->  "a\""
         expr = re.sub(
-            r'"\s*\+\s*(?:CHR\$\s*\(\s*34\s*\)|chr\s*\(\s*34\s*\))',
-            '"',
+            rf'"\s*\+\s*{self._CHR34}',
+            lambda _m: '\\""',
             expr,
             flags=re.IGNORECASE,
         )
-        # Leading CHR$(34): CHR$(34) + "hello" -> '"hello'
+        # Leading: CHR$(34) + "a"  ->  "\"a"
         expr = re.sub(
-            r'(?:CHR\$\s*\(\s*34\s*\)|chr\s*\(\s*34\s*\))\s*\+\s*"',
-            '"',
+            rf'{self._CHR34}\s*\+\s*"',
+            lambda _m: '"\\"',
             expr,
             flags=re.IGNORECASE,
         )
@@ -215,9 +245,6 @@ class ExprConverter:
             r"\bLOWER\$\s*\(([^)]+)\)", r"(\1).lower()", expr, flags=re.IGNORECASE
         )
 
-        if "math." in expr:
-            self._needs_math = True
-
         # MOD(a, b) -> (a) % (b)
         expr = re.sub(
             r"\bMOD\s*\(([^,]+),\s*([^)]+)\)",
@@ -264,10 +291,10 @@ class ExprConverter:
         if cond.startswith("(") and cond.endswith(")") and self._balanced(cond[1:-1]):
             cond = cond[1:-1].strip()
         result = self.convert(cond)
-        # Replace bare = with == (not inside strings, not !=, <=, >=)
-        result = re.sub(r"(?<![!<>])=(?!=)", "==", result)
-        # Fix any === that might have been created
-        result = re.sub(r"===", "==", result)
+        # Replace bare = with == — but only outside string literals, or a
+        # comparison against "x=y" silently becomes "x==y".
+        result = sub_outside_strings(r"(?<![!<>])=(?!=)", "==", result)
+        result = sub_outside_strings(r"===", "==", result)
         return result
 
 
@@ -277,8 +304,25 @@ class ExprConverter:
 class BasicParser:
     """Parse BASIC source into a list of BasicLine objects."""
 
+    @staticmethod
+    def statements(text: str) -> list:
+        """
+        Split one BASIC line into its colon-separated statements.
+
+        REM and DATA swallow the rest of the line, and in an unstructured
+        `IF ... THEN ...` everything after THEN belongs to the THEN clause —
+        so those are left whole.
+        """
+        upper = upper_outside_strings(text)
+        if re.match(r"^\s*(REM|DATA)\b", upper):
+            return [text]
+        if re.match(r"^\s*IF\b", upper) and not re.search(r"\bTHEN\s+BEGIN\s*$", upper):
+            return [text]
+        return split_outside_strings(text, ":")
+
     def parse(self, source: str) -> list:
         lines = []
+        skipped = 0
         for raw_line in source.strip().splitlines():
             raw_line = raw_line.strip()
             if not raw_line:
@@ -286,11 +330,24 @@ class BasicParser:
             # Match line number
             m = re.match(r"^(\d+)\s*(.*)", raw_line)
             if not m:
+                skipped += 1
+                print(
+                    f"Warning: ignoring line without a line number: {raw_line!r}",
+                    file=sys.stderr,
+                )
                 continue
             num = int(m.group(1))
-            text = m.group(2).strip()
-            lines.append(BasicLine(number=num, text=text.upper(), original=text))
-        lines.sort(key=lambda l: l.number)
+            lines.extend(
+                BasicLine(
+                    number=num,
+                    text=upper_outside_strings(stmt),
+                    original=stmt,
+                )
+                for stmt in self.statements(m.group(2).strip())
+            )
+        if skipped:
+            print(f"Warning: {skipped} line(s) had no line number.", file=sys.stderr)
+        lines.sort(key=lambda ln: ln.number)
         return lines
 
 
@@ -325,7 +382,6 @@ class CFGAnalyser:
 
     def __init__(self, lines: list):
         self.lines = lines
-        self.line_map = {l.number: i for i, l in enumerate(lines)}
         self.goto_targets = set()
         self.gosub_targets = set()
         self.func_names = {}  # line_number -> name
@@ -335,7 +391,7 @@ class CFGAnalyser:
     def is_subroutine_start(self, line_num: int) -> bool:
         return line_num in self.gosub_targets
 
-    def func_name_at(self, line_num: int) -> Optional[str]:
+    def func_name_at(self, line_num: int) -> str | None:
         return self.func_names.get(line_num)
 
 
@@ -364,12 +420,14 @@ class Transpiler:
 
     def _emit_imports(self, lines):
         """Scan for needed imports and emit them."""
-        src = " ".join(l.text for l in lines)
+        # Skip REM lines — prose mentioning "END" is not a statement.
+        code = [ln.text for ln in lines if not re.match(r"^REM\b", ln.text)]
+        src = " ".join(code)
         needs_math = bool(
-            re.search(r"\b(SQR|SIN|COS|TAN|ATN|LOG|EXP)\b", src, re.IGNORECASE)
+            re.search(r"\b(SQR|SIN|COS|TAN|ATN|LOG|EXP)\s*\(", src, re.IGNORECASE)
         )
         needs_time = bool(re.search(r"\bSLEEP\b", src, re.IGNORECASE))
-        needs_sys = bool(re.search(r"\bEND\b", src, re.IGNORECASE))
+        needs_sys = any(re.match(r"^END\s*$", stmt) for stmt in code)
 
         if needs_math:
             self._emit("import math")
@@ -394,7 +452,7 @@ class Transpiler:
         for i, line in enumerate(lines):
             if re.match(r"^END\s*$", line.text) and i < len(lines) - 1:
                 # Check if any subroutine targets come after this
-                following_nums = {l.number for l in lines[i + 1 :]}
+                following_nums = {ln.number for ln in lines[i + 1 :]}
                 if following_nums & cfg.gosub_targets:
                     end_idx = i
                     break
@@ -425,24 +483,31 @@ class Transpiler:
 
         return main_lines, subroutines
 
-    def _last_was_return(self, lines):
-        for line in reversed(lines):
-            if re.match(r"^RETURN\s*$", line.text):
-                return True
-            break
-        return False
-
     def _split_print_args(self, args: str) -> list:
-        """Split PRINT args on ; or , outside of string literals."""
+        """
+        Split PRINT args on ; or , at the top level.
+
+        Depth matters: splitting naively tears `MOD(A, 3)` in half at the
+        comma and leaves an unconvertible fragment behind.
+        """
         parts = []
         current = []
         in_string = False
+        depth = 0
 
         for ch in args:
             if ch == '"':
                 in_string = not in_string
                 current.append(ch)
-            elif ch in (";", ",") and not in_string:
+            elif in_string:
+                current.append(ch)
+            elif ch == "(":
+                depth += 1
+                current.append(ch)
+            elif ch == ")":
+                depth = max(0, depth - 1)
+                current.append(ch)
+            elif ch in (";", ",") and depth == 0:
                 parts.append("".join(current))
                 current = []
             else:
@@ -470,18 +535,26 @@ class Transpiler:
         else:
             self._emit(f"print({', '.join(py_parts)})")
 
+    @staticmethod
+    def _wrap_input(basic_var: str, call: str) -> str:
+        """INPUT into a numeric variable reads a number, not a string."""
+        return call if basic_var.rstrip().endswith("$") else f"float({call})"
+
     def _emit_input(self, var_text: str):
         """Convert INPUT statement."""
         # May have a prompt: INPUT "text"; VAR
-        m = re.match(r'^"([^"]+)"\s*[;,]\s*([A-Z][0-9]?\$?)$', var_text, re.IGNORECASE)
+        m = re.match(r'^"([^"]*)"\s*[;,]\s*([A-Z][0-9]?\$?)$', var_text, re.IGNORECASE)
         if m:
             prompt = m.group(1)
-            var = self.vm.map(m.group(2))
-            self._emit(f'{var} = input("{prompt}")')
+            basic_var = m.group(2)
+            var = self.vm.map(basic_var)
+            call = self._wrap_input(basic_var, f'input("{prompt}")')
+            self._emit(f"{var} = {call}")
         else:
-            # Plain INPUT VAR — check if there was a preceding PRINT for the prompt
-            var = self.vm.map(var_text.strip())
-            self._emit(f"{var} = input()")
+            # Plain INPUT VAR — a preceding PRINT usually carried the prompt.
+            basic_var = var_text.strip()
+            var = self.vm.map(basic_var)
+            self._emit(f"{var} = {self._wrap_input(basic_var, 'input()')}")
 
     def _emit_block(self, lines: list, cfg, i: int = 0) -> int:
         """
@@ -512,7 +585,17 @@ class Transpiler:
 
             m = re.match(r"^REM\s+(.*)", text)
             if m:
-                self._emit_comment(m.group(1))
+                # Take the body from the untouched original — a comment is
+                # prose, and uppercasing it loses information.
+                original = re.match(r"^\s*REM\s+(.*)", line.original, re.IGNORECASE)
+                body = original.group(1) if original else m.group(1)
+                self._emit_comment(body.rstrip())
+                i += 1
+                continue
+
+            # EXIT — leaves the enclosing DO loop
+            if re.match(r"^EXIT\s*$", text):
+                self._emit("break")
                 i += 1
                 continue
 
@@ -554,9 +637,11 @@ class Transpiler:
                 i += 1
                 continue
 
-            # DO / LOOP WHILE (BASIC 65/7.0)
-            if re.match(r"^DO\s*$", text):
-                i = self._emit_do_loop(lines, i, cfg)
+            # DO [WHILE|UNTIL cond] ... LOOP [WHILE|UNTIL cond] (BASIC 65/7.0)
+            m = re.match(r"^DO(?:\s+(WHILE|UNTIL)\s+(.+))?$", text, re.IGNORECASE)
+            if m:
+                head = (m.group(1), m.group(2)) if m.group(1) else None
+                i = self._emit_do_loop(lines, i, cfg, head)
                 continue
 
             # BEGIN/BEND structured IF (BASIC 65/7.0)
@@ -595,9 +680,19 @@ class Transpiler:
                 stmt = m.group(2).strip()
                 self._emit(f"if {cond}:")
                 self._indent += 1
-                # Recursively emit the single statement
-                fake_line = BasicLine(number=line.number, text=stmt, original=stmt)
-                self._emit_block([fake_line], cfg, 0)
+                # The THEN clause can hold several colon-separated statements.
+                consequent = [
+                    BasicLine(
+                        number=line.number,
+                        text=upper_outside_strings(s),
+                        original=s,
+                    )
+                    for s in split_outside_strings(stmt, ":")
+                ]
+                if consequent:
+                    self._emit_block(consequent, cfg, 0)
+                else:
+                    self._emit("pass")
                 self._indent -= 1
                 i += 1
                 continue
@@ -672,8 +767,6 @@ class Transpiler:
             self._emit(f"def {func_name}():")
             self._indent = 1
             self._emit_block(sub_body, cfg)
-            if not sub_body or not self._last_was_return(sub_body):
-                pass  # return already emitted or not needed
             self._indent = 0
             self._emit()
             sub_lines_collected.extend(self.output_lines)
@@ -692,6 +785,15 @@ class Transpiler:
         self._emit_block(main_lines, cfg)
 
         return "\n".join(self.output_lines) + "\n"
+
+    @staticmethod
+    def check(result: str) -> str | None:
+        """Return a description of any syntax error in the generated code."""
+        try:
+            ast.parse(result)
+        except SyntaxError as e:
+            return f"line {e.lineno}: {e.msg}"
+        return None
 
     def _try_emit_b20_while(self, lines, i, cfg):
         """
@@ -763,25 +865,35 @@ class Transpiler:
         stop = self.ec.convert(m.group(3))
         step = self.ec.convert(m.group(4)) if m.group(4) else None
 
-        # Collect body until NEXT var
+        # Collect body until NEXT (the variable name is optional in BASIC)
         i += 1
         body = []
         while i < len(lines):
-            next_m = re.match(rf"^NEXT\s+{var_basic}\s*$", lines[i].text, re.IGNORECASE)
-            if next_m:
+            if re.match(rf"^NEXT(\s+{var_basic})?\s*$", lines[i].text, re.IGNORECASE):
                 i += 1
                 break
             body.append(lines[i])
             i += 1
 
-        # Build range()
-        # stop in BASIC is inclusive; we need stop+1
-        # Try to adjust numerically if possible
+        # BASIC's TO bound is inclusive, Python's range() stop is exclusive.
+        # Which way to nudge it depends on the direction of travel: a
+        # descending loop needs stop-1, not stop+1.
+        descending = False
+        if step:
+            try:
+                descending = float(step) < 0
+            except ValueError:
+                # Non-literal step — assume ascending, but say so.
+                self._emit_todo(
+                    f"FOR step {step!r} is not a literal; "
+                    f"range() bound assumes it is positive"
+                )
+        delta = -1 if descending else 1
+
         try:
-            stop_val = int(float(stop))
-            stop_expr = str(stop_val + 1)
+            stop_expr = str(int(float(stop)) + delta)
         except ValueError:
-            stop_expr = f"({stop}) + 1"
+            stop_expr = f"({stop}) {'-' if delta < 0 else '+'} 1"
 
         if step:
             range_expr = f"range({start}, {stop_expr}, {step})"
@@ -795,46 +907,80 @@ class Transpiler:
             self._emit_block(body, cfg)
         # If nothing substantive was emitted, add pass
         substantive = [
-            l
-            for l in self.output_lines[before:]
-            if l.strip() and not l.strip().startswith("#")
+            out
+            for out in self.output_lines[before:]
+            if out.strip() and not out.strip().startswith("#")
         ]
         if not substantive:
             self._emit("pass")
         self._indent -= 1
         return i
 
-    def _emit_do_loop(self, lines, i, cfg):
-        """Emit a DO / LOOP WHILE as a Python while loop."""
+    def _loop_condition(self, keyword: str, expr: str) -> str:
+        cond = self.ec.convert_condition(expr)
+        return f"not ({cond})" if keyword.upper() == "UNTIL" else cond
+
+    def _emit_do_loop(self, lines, i, cfg, head=None):
+        """
+        Emit a DO ... LOOP as a Python while loop.
+
+        `DO WHILE cond ... LOOP` tests at the top, like Python. The
+        `DO ... LOOP WHILE cond` form tests at the bottom and therefore
+        always runs once; that gets a do-while emulation rather than a
+        plain while, which would silently change the trip count.
+        """
         i += 1
         body = []
-        cond_expr = "True"
+        depth = 1
+        tail = None
 
         while i < len(lines):
             text = lines[i].text
-            m = re.match(r"^LOOP\s+WHILE\s+(.+)$", text, re.IGNORECASE)
+            if re.match(r"^DO\b", text, re.IGNORECASE):
+                depth += 1
+                body.append(lines[i])
+                i += 1
+                continue
+            m = re.match(r"^LOOP(?:\s+(WHILE|UNTIL)\s+(.+))?$", text, re.IGNORECASE)
             if m:
-                cond_expr = self.ec.convert_condition(m.group(1))
+                depth -= 1
+                if depth == 0:
+                    if m.group(1):
+                        tail = (m.group(1), m.group(2))
+                    i += 1
+                    break
+                body.append(lines[i])
                 i += 1
-                break
-            m = re.match(r"^LOOP\s+UNTIL\s+(.+)$", text, re.IGNORECASE)
-            if m:
-                cond_expr = f"not ({self.ec.convert_condition(m.group(1))})"
-                i += 1
-                break
-            if re.match(r"^LOOP\s*$", text):
-                i += 1
-                break
+                continue
             body.append(lines[i])
             i += 1
 
-        self._emit(f"while {cond_expr}:")
-        self._indent += 1
-        if body:
-            self._emit_block(body, cfg)
+        if head is not None:
+            self._emit(f"while {self._loop_condition(*head)}:")
+            self._indent += 1
+            if body:
+                self._emit_block(body, cfg)
+            else:
+                self._emit("pass")
+            self._indent -= 1
+        elif tail is not None:
+            # Bottom-tested: run the body, then repeat while the condition holds.
+            self._emit("while True:")
+            self._indent += 1
+            if body:
+                self._emit_block(body, cfg)
+            self._emit(f"if not ({self._loop_condition(*tail)}):")
+            self._indent += 1
+            self._emit("break")
+            self._indent -= 2
         else:
-            self._emit("pass")
-        self._indent -= 1
+            self._emit("while True:")
+            self._indent += 1
+            if body:
+                self._emit_block(body, cfg)
+            else:
+                self._emit("pass")
+            self._indent -= 1
         return i
 
     def _emit_begin_bend_if(self, lines, i, cond_text, cfg):
@@ -976,6 +1122,11 @@ def main():
     )
     parser.add_argument("input", help="BASIC source file")
     parser.add_argument("-o", "--output", help="Output Python file (default: stdout)")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit non-zero if the generated Python does not parse",
+    )
     args = parser.parse_args()
 
     try:
@@ -984,16 +1135,35 @@ def main():
     except FileNotFoundError:
         print(f"Error: file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
+    except OSError as e:
+        print(f"Error: cannot read {args.input}: {e}", file=sys.stderr)
+        sys.exit(1)
 
     t = Transpiler()
     result = t.transpile(source)
 
+    problem = Transpiler.check(result)
+    if problem:
+        print(
+            f"Warning: the generated Python does not parse ({problem}). "
+            f"This is a basic2py bug or an unsupported construct — the output "
+            f"is still written so you can inspect it.",
+            file=sys.stderr,
+        )
+
     if args.output:
-        with open(args.output, "w") as f:
-            f.write(result)
+        try:
+            with open(args.output, "w") as f:
+                f.write(result)
+        except OSError as e:
+            print(f"Error: cannot write {args.output}: {e}", file=sys.stderr)
+            sys.exit(1)
         print(f"Written to {args.output}", file=sys.stderr)
     else:
         print(result)
+
+    if problem and args.check:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

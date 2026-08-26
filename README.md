@@ -14,9 +14,8 @@ Capable of generating BASIC 2.0 (Commodore 64 - the default), BASIC 7.0 (Commodo
 - Python 3.8+
 - No external dependencies (uses Python's built-in `ast` module)
 
-> Note: Despite the name, this transpiler does **not** use ANTLR4. It uses
-> Python's own `ast` module to parse the input, which is simpler and requires
-> no additional tools. The architecture is visitor-based in the same spirit.
+> Note: parsing is done with Python's own `ast` module rather than a parser
+> generator, so there is nothing to install. The architecture is visitor-based.
 
 ## Installation
 
@@ -50,11 +49,17 @@ x = 3.14        # float
 ### Output / Input
 
 ```python
-print("hello")           # -> PRINT "HELLO"
+print("hello")           # -> PRINT "hello"
 print(x, y)              # -> PRINT X ; Y
 print()                  # -> PRINT (blank line)
-name = input("Name? ")   # -> PRINT "Name? " : INPUT A$
+print("a", end="")       # -> PRINT "a";      (no newline)
+print(x, y, sep="-")     # -> PRINT X ; "-" ; Y
+name = input("Name? ")   # -> PRINT "Name? "; : INPUT A$
 ```
+
+String literals are passed through as written — the transpiler does not
+uppercase them. `sep=` and `end=` must be plain string literals, and `end=`
+accepts only `""` or `"\n"`.
 
 ### Math operators
 
@@ -104,11 +109,19 @@ else:              #   BEND ELSE BEGIN
                    # BEND
 ```
 
+That is the BASIC 65 / 7.0 rendering. BASIC 2.0 has no `BEGIN`/`BEND`, so
+the same code becomes `IF NOT (...) THEN GOTO` with jump targets — see the
+FizzBuzz example below.
+
 ```python
-while x < 10:   # DO
+while x < 10:   # DO WHILE X < 10
     x += 1      #   X = X + 1
-                # LOOP WHILE X < 10
+                # LOOP
 ```
+
+`DO WHILE ... LOOP` tests the condition at the top, matching Python. (The
+`DO ... LOOP WHILE` form would be a do-while and always run the body once.)
+On BASIC 2.0 the same loop becomes a `REM` / `IF NOT ... THEN GOTO` pair.
 
 ```python
 for i in range(5):         # FOR I = 0 TO 4
@@ -117,10 +130,27 @@ for i in range(5):         # FOR I = 0 TO 4
 
 for i in range(1, 11):     # FOR I = 1 TO 10
 for i in range(0, 10, 2):  # FOR I = 0 TO 9 STEP 2
+for i in range(10, 0, -1): # FOR I = 10 TO 1 STEP -1
 ```
 
+The `range()` step must be a literal number — BASIC needs to know the loop
+direction at transpile time in order to adjust the inclusive `TO` bound the
+right way.
+
+When the bounds are not known until runtime, a guard is emitted ahead of the
+loop:
+
 ```python
-break   # EXIT  (exits a DO/LOOP)
+for i in range(n):   # IF 0 > N - 1 THEN GOTO <after>
+    print(i)         # FOR A = 0 TO N - 1 ...
+```
+
+That guard is not optional. Commodore BASIC tests the bound at `NEXT`, so a
+bare `FOR I = 0 TO -1` would run its body once where Python's `range(0)` runs
+it zero times.
+
+```python
+break   # EXIT in a while loop; GOTO past NEXT in a for loop
 ```
 
 ### Functions (subroutines)
@@ -140,23 +170,38 @@ to pass data between subroutines — exactly as you would in BASIC.
 
 ```python
 int(x)      # INT(X)
+float(x)    # X          (everything is a float already)
 str(x)      # STR$(X)
 len(s)      # LEN(S$)
 abs(x)      # ABS(X)
 chr(n)      # CHR$(N)
 ord(c)      # ASC(C$)
 round(x)    # INT(X + 0.5)
+sqrt(x)     # SQR(X)
+sin(x)      # SIN(X)     also cos, tan, atan, exp
+log(x)      # LOG(X)
+log(x, b)   # (LOG(X) / LOG(B))
 ```
+
+Argument counts are checked, so `int()` is a clear error rather than a crash.
+
+`s.upper()` and `s.lower()` map to `UPPER$()` / `LOWER$()`, which exist only
+in BASIC 65 — the other dialects reject them.
 
 ### Standard library (limited)
 
 ```python
 import time
-time.sleep(1.5)   # SLEEP 1.5
+time.sleep(1.5)   # SLEEP 1.5   (BASIC 65 only)
 
 import sys
 sys.exit()        # END
+
+import math
+math.sqrt(16)     # SQR(16)
 ```
+
+`import math as m` works too — `m.sqrt(x)` resolves the same way.
 
 ### Comments
 
@@ -167,8 +212,10 @@ sys.exit()        # END
 ### assert
 
 ```python
-assert x > 0           # IF NOT (X > 0) THEN BEGIN : PRINT "Assertion failed" : END : BEND
-assert x > 0, "bad x"  # IF NOT (X > 0) THEN BEGIN : PRINT "BAD X" : END : BEND
+assert x > 0           # IF (X > 0) THEN GOTO <past the check>
+                       # PRINT "ASSERTION FAILED"
+                       # END
+assert x > 0, "bad x"  # ... PRINT "bad x" ...
 ```
 
 ## Variable Names
@@ -199,6 +246,29 @@ Variable map:
 
 Maximum 286 numeric variables and 286 string variables.
 
+Whether a name is numeric or a string is inferred from what is assigned to
+it, following concatenations and f-strings through to a fixpoint:
+
+```python
+name = "world"                 # A$
+greeting = "hello " + name     # B$  — inferred from the concatenation
+count = 3                      # A
+```
+
+A name used for both is rejected, because a BASIC variable cannot change
+type:
+
+```python
+v = 1
+v = "text"   # error: 'v' is assigned both string and numeric values
+```
+
+## Line Numbers
+
+`--start` and `--step` control numbering. `--step` must be at least 1, and
+the transpiler stops with an error rather than emitting a line number above
+Commodore's limit of 63999.
+
 ## What's NOT Supported
 
 The transpiler will give you a clear error message for any of these:
@@ -215,8 +285,20 @@ The transpiler will give you a clear error message for any of these:
 - `global` / `nonlocal`
 - Multiple assignment targets (`a, b = 1, 2`)
 - Chained comparisons (`1 < x < 10`)
-- f-strings (use `str(x)` concatenation instead)
-- Nested functions
+- Ternary expressions (`a if c else b`)
+- Nested or conditional function definitions
+- A `range()` step that is not a literal number
+- Reusing one variable for both strings and numbers
+
+f-strings and `%` formatting **are** supported, minus format specs:
+
+```python
+name = "world"
+age = 7
+print(f"hi {name}, age {age}")   # PRINT "hi " + A$ + ", age " + STR$(B)
+print("hi %s, age %d" % (name, age))
+print(f"{x:.2f}")                # rejected — format specs are not supported
+```
 
 ## Example
 
@@ -238,28 +320,27 @@ while i <= 20:
     i += 1
 ```
 
-Output:
+Output (BASIC 2.0, the default dialect):
 
 ```
 10 A = 1
-20 DO
-30 B = INT(A / 3) * 3
-40 C = INT(A / 5) * 5
-50 IF (B = A) AND (C = A) THEN BEGIN
-60 PRINT "FIZZBUZZ"
-70 BEND ELSE BEGIN
-80 IF B = A THEN BEGIN
-90 PRINT "FIZZ"
-100 BEND ELSE BEGIN
-110 IF C = A THEN BEGIN
-120 PRINT "BUZZ"
-130 BEND ELSE BEGIN
-140 PRINT A
-150 BEND
-160 BEND
-170 BEND
-180 A = A + 1
-190 LOOP WHILE A <= 20
+20 REM
+30 IF NOT (A <= 20) THEN GOTO 180
+40 B = INT(A / 3) * 3
+50 C = INT(A / 5) * 5
+60 IF NOT ((B = A) AND (C = A)) THEN GOTO 90
+70 PRINT "FIZZBUZZ"
+80 GOTO 160
+90 IF NOT (B = A) THEN GOTO 120
+100 PRINT "FIZZ"
+110 GOTO 160
+120 IF NOT (C = A) THEN GOTO 150
+130 PRINT "BUZZ"
+140 GOTO 160
+150 PRINT A
+160 A = A + 1
+170 GOTO 20
+180 END
 ```
 
 ## Transferring to MEGA65

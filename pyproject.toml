@@ -1,0 +1,32 @@
+# Tooling configuration for py2basic / basic2py.
+#
+# There is no package to build here — the two transpilers are standalone
+# scripts with no dependencies. This file exists so that ruff, black and
+# isort behave identically on every machine and in CI. Without an explicit
+# rule selection, a new ruff release can turn a green build red overnight.
+
+[tool.ruff]
+line-length = 88
+target-version = "py38"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+    "C4",   # comprehensions
+    "ARG",  # unused arguments
+    "PERF", # performance
+    "RUF",  # ruff-specific
+]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.black]
+line-length = 88

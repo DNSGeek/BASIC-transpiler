@@ -1,0 +1,22 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Tool caches — the formatting workflow does `git add -A`, so these must be
+# ignored or CI will commit them.
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Transpiler output
+*.bas
+!basic2py/example.bas
+
+# Environments
+.venv/
+venv/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

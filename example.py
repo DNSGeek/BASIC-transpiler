@@ -56,6 +56,6 @@ def banner():
 banner()
 
 # ── Pause ─────────────────────────────────────────────────────────────────────
-for dl in range(5000):
+for _dl in range(5000):
     pass
 print("DONE")
