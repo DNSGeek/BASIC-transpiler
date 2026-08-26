@@ -483,9 +483,4 @@ Output (BASIC 2.0, the default dialect):
 
 ## License
 
-MIT — do whatever you want with it.
-
-## Acknowledgements
-
-Built for the MEGA65 community. BASIC 65 dialect reference from the MEGA65
-User's Guide and ROM 920413 binary analysis.
+GPL v2
