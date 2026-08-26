@@ -62,6 +62,9 @@ class SymbolTable:
     def __init__(self):
         self._numeric: dict = {}
         self._string: dict = {}
+        self._num_array: dict = {}
+        self._str_array: dict = {}
+        self._functions: dict = {}
         self._num_counter = 0
         self._str_counter = 0
 
@@ -99,12 +102,51 @@ class SymbolTable:
             self._string[py_name] = self._next_string_name()
         return self._string[py_name]
 
+    def get_array(self, py_name, is_string):
+        """
+        Arrays live in their own namespace: in Commodore BASIC A and A(0)
+        are different variables, so an array may reuse a scalar's letter.
+        """
+        table = self._str_array if is_string else self._num_array
+        if py_name not in table:
+            if len(table) >= 286:
+                raise TranspilerError(
+                    f"Too many arrays (max 286). Overflow on '{py_name}'"
+                )
+            n = len(table)
+            if n < 26:
+                base = self.LETTERS[n]
+            else:
+                n -= 26
+                base = self.LETTERS[n // 10] + str(n % 10)
+            table[py_name] = base + "$" if is_string else base
+        return table[py_name]
+
+    def get_function(self, py_name):
+        """DEF FN names. FN plus a variable name, e.g. FNA."""
+        if py_name not in self._functions:
+            n = len(self._functions)
+            if n >= 286:
+                raise TranspilerError(
+                    f"Too many DEF FN functions (max 286). Overflow on '{py_name}'"
+                )
+            if n < 26:
+                self._functions[py_name] = "FN" + self.LETTERS[n]
+            else:
+                n -= 26
+                self._functions[py_name] = "FN" + self.LETTERS[n // 10] + str(n % 10)
+        return self._functions[py_name]
+
     def dump(self):
         lines = ["Variable map:"]
         for py, bas in sorted(self._numeric.items()):
             lines.append(f"  {py:20s} -> {bas}")
         for py, bas in sorted(self._string.items()):
             lines.append(f"  {py:20s} -> {bas}")
+        for py, bas in sorted({**self._num_array, **self._str_array}.items()):
+            lines.append(f"  {py:20s} -> {bas}()")
+        for py, bas in sorted(self._functions.items()):
+            lines.append(f"  {py:20s} -> {bas}()")
         return "\n".join(lines)
 
 
@@ -185,6 +227,13 @@ def _fake_mod(left: str, right: str) -> str:
 class DialectEmitter(ABC):
     #: Dialect provides UPPER$() / LOWER$() string-case functions.
     has_string_case = False
+    #: Dialect provides INSTR() for substring search.
+    has_instr = False
+    #: Dialect provides HEX$() and DEC().
+    has_hex = False
+    #: Empty FOR/NEXT iterations per second, used to fake time.sleep().
+    #: Rough — real timing depends on machine, ROM and video standard.
+    delay_loop_rate = 1000
 
     def __init__(self, transpiler):
         self.t = transpiler
@@ -283,7 +332,7 @@ class Basic2Dialect(DialectEmitter):
         cond_ln = t.lines.next()
 
         # Push break context
-        t._break_frames.append({"kind": "while", "lines": []})
+        t._break_frames.append({"kind": "while", "lines": [], "continues": []})
 
         # Emit body
         for stmt in node.body:
@@ -297,9 +346,12 @@ class Basic2Dialect(DialectEmitter):
         t._note_forward_target(end_ln)
         t.emitter.emit(cond_ln, f"IF NOT ({cond}) THEN GOTO {end_ln}")
 
-        # Backfill breaks
-        for bln in t._break_frames.pop()["lines"]:
+        frame = t._break_frames.pop()
+        for bln in frame["lines"]:
             t.emitter.emit(bln, f"GOTO {end_ln}")
+        # continue re-tests the condition, so it jumps to the loop top.
+        for cln in frame["continues"]:
+            t.emitter.emit(cln, f"GOTO {top_ln}")
 
     def emit_break(self, _node):
         self.t._emit_break_goto()
@@ -307,11 +359,8 @@ class Basic2Dialect(DialectEmitter):
     def emit_modulo(self, left, right):
         return _fake_mod(left, right)
 
-    def emit_sleep(self, _seconds_expr):
-        raise TranspilerError(
-            "time.sleep() is not available in BASIC 2.0. "
-            "Use a FOR loop delay instead: FOR DL=1 TO 5000:NEXT DL"
-        )
+    def emit_sleep(self, seconds_expr):
+        self.t.emit_delay_loop(seconds_expr)
 
     def dialect_name(self):
         return "BASIC 2.0"
@@ -320,10 +369,12 @@ class Basic2Dialect(DialectEmitter):
 class Basic65Dialect(DialectEmitter):
     """
     BASIC 65 (MEGA65) — civilised structured programming.
-    BEGIN/BEND, DO WHILE/LOOP, MOD(), SLEEP, UPPER$/LOWER$.
+    BEGIN/BEND, DO WHILE/LOOP, MOD(), SLEEP, UPPER$/LOWER$, INSTR, HEX$.
     """
 
     has_string_case = True
+    has_instr = True
+    has_hex = True
 
     def _emit_if_recursive(self, node):
         t = self.t
@@ -360,11 +411,15 @@ class Basic65Dialect(DialectEmitter):
         # DO WHILE <cond> ... LOOP tests at the TOP, matching Python's while.
         # DO ... LOOP WHILE <cond> would be a do-while and always run once.
         t._emit(f"DO WHILE {cond}")
-        t._break_frames.append({"kind": "while", "lines": []})
+        t._break_frames.append({"kind": "while", "lines": [], "continues": []})
         for stmt in node.body:
             t.visit(stmt)
-        t._break_frames.pop()
-        t._emit("LOOP")
+        frame = t._break_frames.pop()
+        loop_ln = t._emit("LOOP")
+        # There is no CONTINUE statement, so jump to the LOOP, which
+        # branches back to the top and re-tests.
+        for cln in frame["continues"]:
+            t.emitter.emit(cln, f"GOTO {loop_ln}")
 
     def emit_break(self, _node):
         self.t._emit("EXIT")
@@ -385,9 +440,13 @@ class Basic7Dialect(DialectEmitter):
 
     Shares BEGIN/BEND IF and DO/LOOP WHILE with BASIC 65.
     No MOD() function — faked with INT() like BASIC 2.0.
-    No SLEEP — not available.
+    No SLEEP — faked with a FOR/NEXT delay loop.
+    Has INSTR and HEX$/DEC.
     EXIT works for DO/LOOP break.
     """
+
+    has_instr = True
+    has_hex = True
 
     def _emit_if_recursive(self, node):
         t = self.t
@@ -423,11 +482,15 @@ class Basic7Dialect(DialectEmitter):
         cond = t._expr(node.test)
         # DO WHILE ... LOOP tests at the top; DO ... LOOP WHILE would not.
         t._emit(f"DO WHILE {cond}")
-        t._break_frames.append({"kind": "while", "lines": []})
+        t._break_frames.append({"kind": "while", "lines": [], "continues": []})
         for stmt in node.body:
             t.visit(stmt)
-        t._break_frames.pop()
-        t._emit("LOOP")
+        frame = t._break_frames.pop()
+        loop_ln = t._emit("LOOP")
+        # There is no CONTINUE statement, so jump to the LOOP, which
+        # branches back to the top and re-tests.
+        for cln in frame["continues"]:
+            t.emitter.emit(cln, f"GOTO {loop_ln}")
 
     def emit_break(self, _node):
         self.t._emit("EXIT")
@@ -436,11 +499,8 @@ class Basic7Dialect(DialectEmitter):
         # BASIC 7.0 has no MOD() — fake it like BASIC 2.0
         return _fake_mod(left, right)
 
-    def emit_sleep(self, _seconds_expr):
-        raise TranspilerError(
-            "time.sleep() is not available in BASIC 7.0. "
-            "Use a FOR loop delay instead: FOR DL=1 TO 5000:NEXT DL"
-        )
+    def emit_sleep(self, seconds_expr):
+        self.t.emit_delay_loop(seconds_expr)
 
     def dialect_name(self):
         return "BASIC 7.0"
@@ -475,11 +535,11 @@ class Transpiler(ast.NodeVisitor):
 
     #: name -> (min_args, max_args, template). "{0}" style placeholders.
     BUILTINS: ClassVar[dict] = {
-        "int": (1, 1, "INT({0})"),
-        "float": (1, 1, "{0}"),
+        "int": (1, 2, None),  # special-cased: VAL() for strings, DEC() base 16
+        "float": (1, 1, None),  # special-cased: VAL() for strings
         "str": (1, 1, "STR$({0})"),
         "abs": (1, 1, "ABS({0})"),
-        "len": (1, 1, "LEN({0})"),
+        "len": (1, 1, None),  # special-cased: arrays know their own size
         "chr": (1, 1, "CHR$({0})"),
         "ord": (1, 1, "ASC({0})"),
         "round": (1, 1, "INT({0} + 0.5)"),
@@ -490,6 +550,34 @@ class Transpiler(ast.NodeVisitor):
         "atan": (1, 1, "ATN({0})"),
         "exp": (1, 1, "EXP({0})"),
         "log": (1, 2, None),  # special-cased: optional base
+        # BASIC intrinsics with no Python equivalent.
+        "sgn": (1, 1, "SGN({0})"),
+        "peek": (1, 1, "PEEK({0})"),
+        "pos": (0, 1, None),  # special-cased: POS(0)
+        "fre": (0, 1, None),  # special-cased: FRE(0)
+        "tab": (1, 1, "TAB({0})"),
+        "spc": (1, 1, "SPC({0})"),
+        "hex": (1, 1, None),  # special-cased: dialect-gated HEX$()
+    }
+
+    COMPARE_OPS: ClassVar[dict] = {
+        ast.Eq: "=",
+        ast.NotEq: "<>",
+        ast.Lt: "<",
+        ast.LtE: "<=",
+        ast.Gt: ">",
+        ast.GtE: ">=",
+    }
+
+    #: name -> (min_args, max_args, BASIC statement template)
+    STATEMENT_INTRINSICS: ClassVar[dict] = {
+        "poke": (2, 2, "POKE {0}, {1}"),
+        "sys_call": (1, 1, "SYS {0}"),
+        "wait": (2, 3, None),  # optional XOR operand
+        "restore": (0, 0, "RESTORE"),
+        "data": (1, None, None),  # variadic
+        "stop": (0, 0, "STOP"),
+        "basic": (1, 1, None),  # raw escape hatch
     }
 
     def __init__(self, dialect=None):
@@ -497,12 +585,18 @@ class Transpiler(ast.NodeVisitor):
         self.lines = LineAllocator()
         self.emitter = Emitter()
         self._string_vars = set()
+        #: py name -> (basic_name, size, is_string)
+        self._arrays = {}
+        #: py name -> (basic_fn_name, param_py_name)
+        self._fn_defs = {}
+        self._fn_param_scope = None
         self._functions = {}
         self._gosub_backfills = []
         self._toplevel_defs = set()
         self._break_frames = []
         self._forward_targets = set()
         self._math_aliases = {"math"}
+        self._random_aliases = {"random"}
         self.dialect = dialect or Basic2Dialect(self)
 
     # ── Type inference ─────────────────────────────────────────────────────────
@@ -524,10 +618,18 @@ class Transpiler(ast.NodeVisitor):
                 # "fmt %s" % args
                 return self._is_string_expr(node.left)
             return False
+        if isinstance(node, ast.Subscript):
+            base = node.value
+            if isinstance(base, ast.Name) and base.id in self._arrays:
+                return self._arrays[base.id][2]
+            # A slice of a string is a string.
+            return self._is_string_expr(base)
         if isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Name):
-                return func.id in self.STRING_CALLS
+                if func.id in self.STRING_CALLS:
+                    return True
+                return func.id in ("hex", "getkey")
             if isinstance(func, ast.Attribute):
                 return func.attr in self.STRING_METHODS
         return False
@@ -550,12 +652,53 @@ class Transpiler(ast.NodeVisitor):
             return node.func.id in self.NUMERIC_CALLS
         return False
 
+    @staticmethod
+    def _static_num(node):
+        """Literal numeric value of node, or None. Sees through unary +/-."""
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+                return None
+            return node.value
+        if isinstance(node, ast.UnaryOp):
+            inner = Transpiler._static_num(node.operand)
+            if inner is None:
+                return None
+            if isinstance(node.op, ast.USub):
+                return -inner
+            if isinstance(node.op, ast.UAdd):
+                return inner
+        return None
+
+    def _list_literal(self, value):
+        """
+        Describe a list-shaped initialiser, or None if it is not one.
+
+        Recognised:
+            [a, b, c]      explicit elements
+            [x] * n        n copies of a fill value
+            [0] * n        the usual "allocate an array" idiom
+        """
+        if isinstance(value, ast.List):
+            return list(value.elts), None
+        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Mult):
+            for lst, count in (
+                (value.left, value.right),
+                (value.right, value.left),
+            ):
+                if isinstance(lst, ast.List) and len(lst.elts) == 1:
+                    size = self._static_num(count)
+                    if size is None or size < 1 or size != int(size):
+                        return None
+                    return None, (lst.elts[0], int(size))
+        return None
+
     def _assign_pairs(self, tree):
         """Yield (target_names, value_node, lineno) for every assignment."""
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign):
                 names = [t.id for t in node.targets if isinstance(t, ast.Name)]
-                if names:
+                # A list initialiser types the array, not a scalar.
+                if names and self._list_literal(node.value) is None:
                     yield names, node.value, getattr(node, "lineno", 0)
             elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
                 yield [node.target.id], node.value, getattr(node, "lineno", 0)
@@ -593,31 +736,104 @@ class Transpiler(ast.NodeVisitor):
                         lineno,
                     )
 
-    # ── Forward jump bookkeeping ───────────────────────────────────────────────
+    # ── Arrays ─────────────────────────────────────────────────────────────────
 
-    def _note_forward_target(self, line_num):
-        """Record a GOTO target that has not been emitted yet."""
-        self._forward_targets.add(line_num)
+    def _array_size(self, node):
+        """Element count of the array node refers to, or None."""
+        if isinstance(node, ast.Name) and node.id in self._arrays:
+            return self._arrays[node.id][1]
+        return None
 
-    def _emit_landing_pads(self):
-        """
-        BASIC 2.0 leaves a construct by jumping to "the line after it". When
-        the construct is the last thing in the program that line never gets
-        emitted, and the machine raises ?UNDEF'D STATEMENT ERROR at runtime.
-        Emit a landing line for any target that ended up dangling.
-        """
-        if not self._forward_targets:
-            return
-        highest = max(self.emitter.line_numbers(), default=0)
-        for target in sorted(self._forward_targets):
-            if not self.emitter.has_line(target):
-                self.emitter.emit(target, "END" if target > highest else "REM")
+    def _subscript_expr(self, node):
+        """Compile array indexing and string slicing."""
+        lineno = getattr(node, "lineno", 0)
+        base = node.value
+        index = node.slice
 
-    def _emit_break_goto(self):
-        """Reserve a line for a `break` and register it for backfilling."""
-        ln = self.lines.next()
-        self.emitter.emit(ln, "GOTO 0")  # placeholder, backfilled by the loop
-        self._break_frames[-1]["lines"].append(ln)
+        # Array element: xs[i] -> A(I)
+        if isinstance(base, ast.Name) and base.id in self._arrays:
+            if isinstance(index, ast.Slice):
+                raise TranspilerError("Slicing a list is not supported.", lineno)
+            basic_name, size, _ = self._arrays[base.id]
+            const = self._static_num(index)
+            if const is not None:
+                if const < 0:
+                    raise TranspilerError(
+                        "Negative list indices are not supported — BASIC "
+                        "subscripts start at 0.",
+                        lineno,
+                    )
+                if const >= size:
+                    raise TranspilerError(
+                        f"Index {int(const)} is out of range for a list of " f"{size}.",
+                        lineno,
+                    )
+            return f"{basic_name}({self._expr(index)})"
+
+        # String slicing: LEFT$ / RIGHT$ / MID$
+        if self._is_string_expr(base):
+            return self._string_slice(base, index, lineno)
+
+        raise TranspilerError(
+            "Subscripting is supported on lists and strings only.", lineno
+        )
+
+    def _string_slice(self, base, index, lineno):
+        target = self._expr(base)
+
+        if not isinstance(index, ast.Slice):
+            # s[i] -> MID$(S$, i + 1, 1); BASIC positions are 1-based.
+            const = self._static_num(index)
+            if const is not None and const < 0:
+                back = int(-const) - 1
+                pos = f"LEN({target})" if back == 0 else f"LEN({target}) - {back}"
+                return f"MID$({target}, {pos}, 1)"
+            return f"MID$({target}, {self._offset(index)}, 1)"
+
+        if index.step is not None:
+            raise TranspilerError("Slice steps are not supported.", lineno)
+
+        lower, upper = index.lower, index.upper
+        low_const = self._static_num(lower) if lower is not None else 0
+        up_const = self._static_num(upper) if upper is not None else None
+
+        # s[:n] -> LEFT$
+        if lower is None or low_const == 0:
+            if upper is None:
+                return target
+            if up_const is not None and up_const < 0:
+                return f"LEFT$({target}, LEN({target}) - {int(-up_const)})"
+            return f"LEFT$({target}, {_atom(self._expr(upper))})"
+
+        # s[-n:] -> RIGHT$
+        if upper is None and low_const is not None and low_const < 0:
+            return f"RIGHT$({target}, {int(-low_const)})"
+
+        if low_const is not None and low_const < 0:
+            raise TranspilerError(
+                "A negative slice start is supported only as s[-n:].", lineno
+            )
+
+        start = self._offset(lower)
+        if upper is None:
+            return f"MID$({target}, {start})"
+        if up_const is not None and up_const < 0:
+            raise TranspilerError(
+                "A negative slice end is supported only as s[:-n].", lineno
+            )
+        # Length is upper - lower.
+        if low_const is not None and up_const is not None:
+            length = str(int(up_const - low_const))
+        else:
+            length = f"{_atom(self._expr(upper))} - {_atom(self._expr(lower))}"
+        return f"MID$({target}, {start}, {length})"
+
+    def _offset(self, node):
+        """Python 0-based index as a 1-based BASIC position."""
+        const = self._static_num(node)
+        if const is not None:
+            return str(int(const) + 1)
+        return f"{_atom(self._expr(node))} + 1"
 
     def _basic_var(self, py_name):
         if py_name in self._string_vars:
@@ -668,6 +884,14 @@ class Transpiler(ast.NodeVisitor):
                 return "-1"
             if node.id == "False":
                 return "0"
+            if self._fn_param_scope is not None and node.id == self._fn_param_scope[0]:
+                return self.sym.get_numeric(self._fn_param_scope[1])
+            if node.id in self._arrays:
+                raise TranspilerError(
+                    f"'{node.id}' is a list; BASIC has no whole-array value. "
+                    f"Index it, or use len({node.id}).",
+                    getattr(node, "lineno", 0),
+                )
             return self._basic_var(node.id)
 
         if isinstance(node, ast.BinOp):
@@ -727,27 +951,7 @@ class Transpiler(ast.NodeVisitor):
             return f" {op} ".join(parts)
 
         if isinstance(node, ast.Compare):
-            if len(node.ops) != 1:
-                raise TranspilerError(
-                    "Chained comparisons not supported", getattr(node, "lineno", 0)
-                )
-            left = self._expr(node.left)
-            right = self._expr(node.comparators[0])
-            op_map = {
-                ast.Eq: "=",
-                ast.NotEq: "<>",
-                ast.Lt: "<",
-                ast.LtE: "<=",
-                ast.Gt: ">",
-                ast.GtE: ">=",
-            }
-            basic_op = op_map.get(type(node.ops[0]))
-            if not basic_op:
-                raise TranspilerError(
-                    f"Unsupported comparison: {type(node.ops[0]).__name__}",
-                    getattr(node, "lineno", 0),
-                )
-            return f"{left} {basic_op} {right}"
+            return self._compare_expr(node)
 
         if isinstance(node, ast.Call):
             return self._call_expr(node)
@@ -757,12 +961,175 @@ class Transpiler(ast.NodeVisitor):
                 "Ternary expressions not supported.", getattr(node, "lineno", 0)
             )
 
+        if isinstance(node, ast.Subscript):
+            return self._subscript_expr(node)
+
         if isinstance(node, ast.JoinedStr):
             return self._expand_fstring(node)
 
         raise TranspilerError(
             f"Unsupported expression: {type(node).__name__}", getattr(node, "lineno", 0)
         )
+
+    # ── Emitter helpers ────────────────────────────────────────────────────────
+
+    def _emit(self, text):
+        ln = self.lines.next()
+        self.emitter.emit(ln, text)
+        return ln
+
+    def _declare_array(self, py_name, value, lineno):
+        """Compile a list assignment into DIM plus element initialisers."""
+        shape = self._list_literal(value)
+        if shape is None:
+            return False
+        elements, fill = shape
+
+        if py_name in self._arrays:
+            raise TranspilerError(
+                f"Array '{py_name}' is already declared. BASIC cannot "
+                f"re-DIM an array.",
+                lineno,
+            )
+
+        if fill is not None:
+            fill_node, size = fill
+            is_string = self._is_string_expr(fill_node)
+            elements = None
+        else:
+            if not elements:
+                raise TranspilerError(
+                    "Empty list — BASIC arrays need a fixed size, e.g. " "[0] * 10.",
+                    lineno,
+                )
+            size = len(elements)
+            is_string = self._is_string_expr(elements[0])
+            for el in elements:
+                if self._is_string_expr(el) != is_string:
+                    raise TranspilerError(
+                        "List mixes strings and numbers; BASIC arrays hold "
+                        "one type.",
+                        lineno,
+                    )
+
+        basic_name = self.sym.get_array(py_name, is_string)
+        self._arrays[py_name] = (basic_name, size, is_string)
+
+        # DIM A(n) allocates subscripts 0..n, so a Python list of n elements
+        # needs DIM A(n - 1).
+        self._emit(f"DIM {basic_name}({size - 1})")
+
+        if elements is not None:
+            for index, el in enumerate(elements):
+                self._emit(f"{basic_name}({index}) = {self._expr(el)}")
+        else:
+            zero = "0" if not is_string else '""'
+            filled = self._expr(fill_node)
+            if filled != zero:
+                # BASIC already zero/empty-fills on DIM; only loop if the
+                # requested fill differs.
+                loop_var = self.sym.get_numeric(f"__fill_{py_name}")
+                self._emit(f"FOR {loop_var} = 0 TO {size - 1}")
+                self._emit(f"{basic_name}({loop_var}) = {filled}")
+                self._emit(f"NEXT {loop_var}")
+        return True
+
+    # ── Forward jump bookkeeping ───────────────────────────────────────────────
+
+    def _note_forward_target(self, line_num):
+        """Record a GOTO target that has not been emitted yet."""
+        self._forward_targets.add(line_num)
+
+    def _emit_landing_pads(self):
+        """
+        BASIC 2.0 leaves a construct by jumping to "the line after it". When
+        the construct is the last thing in the program that line never gets
+        emitted, and the machine raises ?UNDEF'D STATEMENT ERROR at runtime.
+        Emit a landing line for any target that ended up dangling.
+        """
+        if not self._forward_targets:
+            return
+        highest = max(self.emitter.line_numbers(), default=0)
+        for target in sorted(self._forward_targets):
+            if not self.emitter.has_line(target):
+                self.emitter.emit(target, "END" if target > highest else "REM")
+
+    @staticmethod
+    def _static_num_from_text(expr):
+        try:
+            return float(expr)
+        except ValueError:
+            return None
+
+    def emit_delay_loop(self, seconds_expr):
+        """
+        Fake time.sleep() on dialects with no SLEEP, using the empty
+        FOR/NEXT loop the error message used to tell people to write.
+
+        The iteration count is approximate — real timing depends on the
+        machine, its ROM and the video standard.
+        """
+        rate = self.dialect.delay_loop_rate
+        seconds = self._static_num_from_text(seconds_expr)
+        count = (
+            str(int(seconds * rate))
+            if seconds is not None
+            else f"({seconds_expr}) * {rate}"
+        )
+        var = self.sym.get_numeric("__delay")
+        self._emit(f"FOR {var} = 1 TO {count}")
+        self._emit(f"NEXT {var}")
+
+    def _emit_break_goto(self):
+        """Reserve a line for a `break` and register it for backfilling."""
+        ln = self.lines.next()
+        self.emitter.emit(ln, "GOTO 0")  # placeholder, backfilled by the loop
+        self._break_frames[-1]["lines"].append(ln)
+
+    def _require(self, flag, lineno, what):
+        if not getattr(self.dialect, flag):
+            raise TranspilerError(
+                f"{what} is not available in {self.dialect.dialect_name()}.",
+                lineno,
+            )
+
+    def _compare_expr(self, node):
+        """
+        Compile a comparison, including the chained form.
+
+        `a < b < c` becomes `(a < b) AND (b < c)`. Re-evaluating b is safe
+        because BASIC expressions have no side effects.
+        """
+        lineno = getattr(node, "lineno", 0)
+        operands = [node.left, *node.comparators]
+        parts = []
+
+        for i, op in enumerate(node.ops):
+            left_node, right_node = operands[i], operands[i + 1]
+
+            # `sub in s` -> INSTR(S$, SUB$) > 0
+            if isinstance(op, (ast.In, ast.NotIn)):
+                self._require("has_instr", lineno, "the `in` operator (INSTR)")
+                if not self._is_string_expr(right_node):
+                    raise TranspilerError(
+                        "`in` is supported for substring tests only.", lineno
+                    )
+                probe = f"INSTR({self._expr(right_node)}, " f"{self._expr(left_node)})"
+                parts.append(f"{probe} {'=' if isinstance(op, ast.NotIn) else '>'} 0")
+                continue
+
+            basic_op = self.COMPARE_OPS.get(type(op))
+            if not basic_op:
+                raise TranspilerError(
+                    f"Unsupported comparison: {type(op).__name__}", lineno
+                )
+            left = self._expr(left_node)
+            right = self._expr(right_node)
+            parts.append(f"{left} {basic_op} {right}")
+
+        if len(parts) == 1:
+            return parts[0]
+        return " AND ".join(f"({p})" for p in parts)
 
     def _expand_percent_format(self, fmt: str, args_node, lineno: int) -> str:
         """
@@ -916,13 +1283,82 @@ class Transpiler(ast.NodeVisitor):
                 f"'{name}()' takes {want} argument(s), got {count}.", lineno
             )
 
+    def _random_expr(self, attr, node, lineno):
+        """
+        random.* -> RND().
+
+        RND(1) returns a float in [0, 1) exactly like random.random().
+        """
+        args = [self._expr(a) for a in node.args]
+        if attr == "random":
+            if args:
+                raise TranspilerError("random.random() takes no arguments.", lineno)
+            return "RND(1)"
+        if attr in ("randint", "randrange"):
+            if attr == "randint":
+                if len(args) != 2:
+                    raise TranspilerError("random.randint() takes 2 arguments.", lineno)
+                low, high = args
+                span = f"{_atom(high)} - {_atom(low)} + 1"
+            else:
+                if len(args) == 1:
+                    low, span = "0", _atom(args[0])
+                elif len(args) == 2:
+                    low, span = args[0], f"{_atom(args[1])} - {_atom(args[0])}"
+                else:
+                    raise TranspilerError(
+                        "random.randrange() takes 1 or 2 arguments.", lineno
+                    )
+            base = f"INT(RND(1) * ({span}))"
+            return base if low == "0" else f"{base} + {_atom(low)}"
+        raise TranspilerError(f"random.{attr}() has no BASIC equivalent.", lineno)
+
     def _builtin_expr(self, name, node, lineno):
         self._check_call(name, node, lineno)
+
+        # int(s, 16) -> DEC(s$). Handled before the args are compiled so the
+        # base can be inspected as a literal.
+        if name == "int" and len(node.args) == 2:
+            base = self._static_num(node.args[1])
+            if base != 16:
+                raise TranspilerError(
+                    "int(x, base) supports only base 16, which maps to DEC().",
+                    lineno,
+                )
+            self._require("has_hex", lineno, "DEC()")
+            return f"DEC({self._expr(node.args[0])})"
+
+        if name == "len":
+            size = self._array_size(node.args[0])
+            if size is not None:
+                return str(size)
+
         args = [self._expr(a) for a in node.args]
+
         if name == "log":
             if len(args) == 2:
                 return f"(LOG({args[0]}) / LOG({args[1]}))"
             return f"LOG({args[0]})"
+
+        if name in ("int", "float"):
+            # A string operand needs VAL(), not INT() — INT("42") is a
+            # ?TYPE MISMATCH ERROR on real hardware.
+            inner = f"VAL({args[0]})" if self._is_string_expr(node.args[0]) else args[0]
+            return f"INT({inner})" if name == "int" else inner
+
+        if name == "len":
+            # Arrays were handled above; anything else must be a string.
+            if not self._is_string_expr(node.args[0]):
+                raise TranspilerError("len() needs a string or a list.", lineno)
+            return f"LEN({args[0]})"
+
+        if name in ("pos", "fre"):
+            return f"{name.upper()}({args[0] if args else '0'})"
+
+        if name == "hex":
+            self._require("has_hex", lineno, "HEX$()")
+            return f"HEX$({args[0]})"
+
         return self.BUILTINS[name][2].format(*args)
 
     def _call_expr(self, node):
@@ -930,6 +1366,13 @@ class Transpiler(ast.NodeVisitor):
 
         if isinstance(node.func, ast.Name):
             name = node.func.id
+            if name in self._fn_defs:
+                if len(node.args) != 1 or node.keywords:
+                    raise TranspilerError(
+                        f"'{name}()' takes exactly 1 argument.", lineno
+                    )
+                fn_basic = self._fn_defs[name][0]
+                return f"{fn_basic}({self._expr(node.args[0])})"
             if name in self.BUILTINS:
                 return self._builtin_expr(name, node, lineno)
             if name == "input":
@@ -946,12 +1389,25 @@ class Transpiler(ast.NodeVisitor):
             obj = node.func.value
             attr = node.func.attr
             if isinstance(obj, ast.Name):
+                if obj.id in self._random_aliases:
+                    return self._random_expr(attr, node, lineno)
                 # math.sqrt(x) and friends — same table as the bare names.
                 if obj.id in self._math_aliases:
                     if attr in self.BUILTINS:
                         return self._builtin_expr(attr, node, lineno)
                     raise TranspilerError(
                         f"math.{attr}() has no BASIC equivalent.", lineno
+                    )
+                if attr in ("find", "index"):
+                    self._require("has_instr", lineno, "str.find() (INSTR)")
+                    if len(node.args) != 1:
+                        raise TranspilerError(
+                            f".{attr}() takes exactly 1 argument here.", lineno
+                        )
+                    # INSTR is 1-based and returns 0 when absent, so -1 maps
+                    # it onto Python's 0-based / -1 convention exactly.
+                    return (
+                        f"INSTR({self._expr(obj)}, " f"{self._expr(node.args[0])}) - 1"
                     )
                 if attr in self.STRING_METHODS:
                     if not self.dialect.has_string_case:
@@ -966,15 +1422,69 @@ class Transpiler(ast.NodeVisitor):
 
         raise TranspilerError(f"Unsupported call: {ast.dump(node)}", lineno)
 
-    # ── Emitter helpers ────────────────────────────────────────────────────────
-
-    def _emit(self, text):
-        ln = self.lines.next()
-        self.emitter.emit(ln, text)
-        return ln
-
     def _emit_at(self, line_num, text):
         self.emitter.emit(line_num, text)
+
+    @staticmethod
+    def _fn_body_expr(node):
+        """
+        The single returned expression of a DEF FN candidate, or None.
+
+        BASIC's DEF FN is one expression, so only `return <expr>` — with an
+        optional leading docstring — can become one.
+        """
+        body = [
+            s
+            for s in node.body
+            if not (
+                isinstance(s, ast.Expr)
+                and isinstance(s.value, ast.Constant)
+                and isinstance(s.value.value, str)
+            )
+        ]
+        if len(body) != 1 or not isinstance(body[0], ast.Return):
+            return None
+        return body[0].value
+
+    def _is_fn_def(self, node):
+        """True if node maps onto BASIC's DEF FN rather than GOSUB."""
+        a = node.args
+        return (
+            len(a.args) == 1
+            and not (a.vararg or a.kwarg or a.kwonlyargs or a.defaults)
+            and self._fn_body_expr(node) is not None
+        )
+
+    def _emit_fn_def(self, node):
+        """def f(x): return <expr>   ->   DEF FNA(X) = <expr>"""
+        lineno = node.lineno
+        param_py = node.args.args[0].arg
+        # Scope the parameter so it cannot collide with a global of the
+        # same Python name.
+        param_key = f"{node.name}.{param_py}"
+        if param_py in self._string_vars:
+            raise TranspilerError(
+                f"DEF FN parameter '{param_py}' must be numeric — BASIC has "
+                f"no string-valued user functions.",
+                lineno,
+            )
+        param_basic = self.sym.get_numeric(param_key)
+        fn_basic = self.sym.get_function(node.name)
+        self._fn_defs[node.name] = (fn_basic, param_key)
+
+        expr_node = self._fn_body_expr(node)
+        if self._is_string_expr(expr_node):
+            raise TranspilerError(
+                f"Function '{node.name}' returns a string. BASIC's DEF FN "
+                f"returns numbers only.",
+                lineno,
+            )
+        self._fn_param_scope = param_py, param_key
+        try:
+            body = self._expr(expr_node)
+        finally:
+            self._fn_param_scope = None
+        self._emit(f"DEF {fn_basic}({param_basic}) = {body}")
 
     # ── Statement visitors ─────────────────────────────────────────────────────
 
@@ -982,18 +1492,31 @@ class Transpiler(ast.NodeVisitor):
         self._infer_string_vars(node)
 
         top_defs = [s for s in node.body if isinstance(s, ast.FunctionDef)]
-        has_functions = bool(top_defs)
 
-        # Pre-register functions (placeholder=0) so call sites can find them.
-        # Only top-level defs qualify; anything nested is rejected in
-        # visit_FunctionDef rather than crashing with a KeyError.
+        seen = set()
         for fn in top_defs:
-            if fn.name in self._functions:
+            if fn.name in seen:
                 raise TranspilerError(
                     f"Function '{fn.name}' is defined more than once.", fn.lineno
                 )
-            self._functions[fn.name] = 0
+            seen.add(fn.name)
             self._toplevel_defs.add(id(fn))
+
+        # A one-argument single-expression numeric function becomes a BASIC
+        # DEF FN; everything else becomes a GOSUB subroutine.
+        fn_defs = [s for s in top_defs if self._is_fn_def(s)]
+        sub_defs = [s for s in top_defs if s not in fn_defs]
+        has_functions = bool(sub_defs)
+
+        # Pre-register subroutines (placeholder=0) so call sites can find
+        # them. Only top-level defs qualify; anything nested is rejected in
+        # visit_FunctionDef rather than crashing with a KeyError.
+        for fn in sub_defs:
+            self._functions[fn.name] = 0
+
+        # DEF FN has to run before any FN reference, so it goes first.
+        for fn in fn_defs:
+            self._emit_fn_def(fn)
 
         # Emit main body
         for stmt in node.body:
@@ -1007,10 +1530,9 @@ class Transpiler(ast.NodeVisitor):
             # Emit each subroutine completely before moving to the next,
             # assigning its line number immediately before emitting its body.
             # This prevents interleaving when multiple functions are defined.
-            for stmt in node.body:
-                if isinstance(stmt, ast.FunctionDef):
-                    self._functions[stmt.name] = self.lines.next()
-                    self.visit(stmt)
+            for stmt in sub_defs:
+                self._functions[stmt.name] = self.lines.next()
+                self.visit(stmt)
 
             # Backfill all GOSUB placeholders now that line numbers are known
             for gosub_ln, func_name in self._gosub_backfills:
@@ -1028,9 +1550,9 @@ class Transpiler(ast.NodeVisitor):
             )
         if node.args.args or node.args.vararg or node.args.kwarg:
             raise TranspilerError(
-                f"Function '{node.name}' has parameters. "
-                f"BASIC subroutines cannot take parameters. "
-                f"Use global variables instead.",
+                f"Function '{node.name}' has parameters. Only a single-"
+                f"expression numeric function (def f(x): return ...) can "
+                f"become a BASIC DEF FN; otherwise use global variables.",
                 lineno,
             )
 
@@ -1090,6 +1612,61 @@ class Transpiler(ast.NodeVisitor):
             stmt += ";"
         self._emit(stmt)
 
+    def _emit_intrinsic(self, name, node, lineno):
+        low, high, template = self.STATEMENT_INTRINSICS[name]
+        if node.keywords:
+            raise TranspilerError(
+                f"'{name}()' does not accept keyword arguments.", lineno
+            )
+        count = len(node.args)
+        if count < low or (high is not None and count > high):
+            want = (
+                str(low)
+                if low == high
+                else f"{low}+" if high is None else f"{low}-{high}"
+            )
+            raise TranspilerError(
+                f"'{name}()' takes {want} argument(s), got {count}.", lineno
+            )
+
+        if name == "basic":
+            # Raw BASIC passthrough, for dialect commands this transpiler
+            # does not model (graphics, sound, disk).
+            arg = node.args[0]
+            if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+                raise TranspilerError("basic() takes a literal string.", lineno)
+            text = arg.value.strip()
+            if not text:
+                raise TranspilerError("basic() needs a statement.", lineno)
+            self._emit(text)
+            return
+
+        if name == "data":
+            items = []
+            for a in node.args:
+                if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                    if '"' in a.value or "," in a.value or ":" in a.value:
+                        raise TranspilerError(
+                            'data() strings cannot contain " , or :', lineno
+                        )
+                    items.append(f'"{a.value}"')
+                else:
+                    value = self._static_num(a)
+                    if value is None:
+                        raise TranspilerError(
+                            "data() takes literal numbers and strings only.",
+                            lineno,
+                        )
+                    items.append(str(value))
+            self._emit("DATA " + ",".join(items))
+            return
+
+        args = [self._expr(a) for a in node.args]
+        if name == "wait":
+            self._emit("WAIT " + ", ".join(args))
+            return
+        self._emit(template.format(*args))
+
     def _compile_call_stmt(self, node):
         lineno = getattr(node, "lineno", 0)
 
@@ -1113,6 +1690,17 @@ class Transpiler(ast.NodeVisitor):
                 self._emit("END")
                 return
 
+            if name in self.STATEMENT_INTRINSICS:
+                self._emit_intrinsic(name, node, lineno)
+                return
+
+            if name in self._fn_defs:
+                raise TranspilerError(
+                    f"'{name}()' is a DEF FN function — use its result, "
+                    f"e.g. x = {name}(...).",
+                    lineno,
+                )
+
             if name in self._functions:
                 ln = self.lines.next()
                 self.emitter.emit(ln, "GOSUB 0")
@@ -1134,6 +1722,17 @@ class Transpiler(ast.NodeVisitor):
                     return
                 if obj.id == "sys" and attr == "exit":
                     self._emit("END")
+                    return
+                if obj.id in self._random_aliases and attr == "seed":
+                    if len(node.args) != 1:
+                        raise TranspilerError(
+                            "random.seed() takes exactly 1 argument.", lineno
+                        )
+                    # RND(<negative>) reseeds; the result has to land
+                    # somewhere, so it goes in a scratch variable.
+                    scratch = self.sym.get_numeric("__rnd_seed")
+                    seed = self._expr(node.args[0])
+                    self._emit(f"{scratch} = RND(-ABS({seed}))")
                     return
             raise TranspilerError(f"Unsupported method call: {ast.dump(node)}", lineno)
 
@@ -1164,6 +1763,12 @@ class Transpiler(ast.NodeVisitor):
                 "Multiple assignment targets not supported", node.lineno
             )
         target = node.targets[0]
+
+        # xs[i] = v  ->  A(I) = v
+        if isinstance(target, ast.Subscript):
+            self._emit(f"{self._subscript_expr(target)} = {self._expr(node.value)}")
+            return
+
         if not isinstance(target, ast.Name):
             raise TranspilerError(
                 "Only simple variable assignment supported", node.lineno
@@ -1171,6 +1776,36 @@ class Transpiler(ast.NodeVisitor):
 
         py_name = target.id
         value = node.value
+
+        # xs = [0] * 10  ->  DIM A(9)
+        if self._declare_array(py_name, value, node.lineno):
+            return
+
+        if py_name in self._arrays:
+            raise TranspilerError(
+                f"'{py_name}' is a list; assign to its elements instead.",
+                node.lineno,
+            )
+
+        # var = getkey()  ->  GET A$     var = read()  ->  READ A
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id in ("getkey", "read")
+        ):
+            if value.args or value.keywords:
+                raise TranspilerError(
+                    f"{value.func.id}() takes no arguments.", node.lineno
+                )
+            if value.func.id == "getkey" and py_name not in self._string_vars:
+                raise TranspilerError(
+                    f"getkey() returns a string; '{py_name}' is numeric. "
+                    f"Initialise it with an empty string first.",
+                    node.lineno,
+                )
+            keyword = "GET" if value.func.id == "getkey" else "READ"
+            self._emit(f"{keyword} {self._basic_var(py_name)}")
+            return
 
         # var = input("prompt")
         if (
@@ -1189,12 +1824,15 @@ class Transpiler(ast.NodeVisitor):
         self._emit(f"{basic_var} = {self._expr(value)}")
 
     def visit_AugAssign(self, node):
-        if not isinstance(node.target, ast.Name):
+        if isinstance(node.target, ast.Subscript):
+            basic_var = self._subscript_expr(node.target)
+        elif isinstance(node.target, ast.Name):
+            basic_var = self._basic_var(node.target.id)
+        else:
             raise TranspilerError(
-                "Augmented assignment only for simple variables", node.lineno
+                "Augmented assignment only for variables and list elements",
+                node.lineno,
             )
-        py_name = node.target.id
-        basic_var = self._basic_var(py_name)
         rhs = self._expr(node.value)
         op = node.op
 
@@ -1224,23 +1862,6 @@ class Transpiler(ast.NodeVisitor):
         if node.orelse:
             raise TranspilerError("while/else not supported", node.lineno)
         self.dialect.emit_while(node)
-
-    @staticmethod
-    def _static_num(node):
-        """Literal numeric value of node, or None. Sees through unary +/-."""
-        if isinstance(node, ast.Constant):
-            if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
-                return None
-            return node.value
-        if isinstance(node, ast.UnaryOp):
-            inner = Transpiler._static_num(node.operand)
-            if inner is None:
-                return None
-            if isinstance(node.op, ast.USub):
-                return -inner
-            if isinstance(node.op, ast.UAdd):
-                return inner
-        return None
 
     def visit_For(self, node):
         lineno = node.lineno
@@ -1300,8 +1921,16 @@ class Transpiler(ast.NodeVisitor):
         delta = -1 if step_val > 0 else 1
         stop_val = self._static_num(stop_node)
         if stop_val is None:
-            sign = "-" if delta < 0 else "+"
-            stop_expr = f"{_atom(self._expr(stop_node))} {sign} 1"
+            # The bound may still be constant after compiling — len() of an
+            # array folds to a literal, for instance.
+            compiled = self._expr(stop_node)
+            stop_val = self._static_num_from_text(compiled)
+            if stop_val is None:
+                sign = "-" if delta < 0 else "+"
+                stop_expr = f"{_atom(compiled)} {sign} 1"
+            else:
+                stop_val = int(stop_val) + delta
+                stop_expr = str(stop_val)
         else:
             stop_val += delta
             stop_expr = str(stop_val)
@@ -1323,12 +1952,15 @@ class Transpiler(ast.NodeVisitor):
             header += f" STEP {step_expr}"
         self._emit(header)
 
-        self._break_frames.append({"kind": "for", "lines": []})
+        self._break_frames.append({"kind": "for", "lines": [], "continues": []})
         for stmt in node.body:
             self.visit(stmt)
         frame = self._break_frames.pop()
 
-        self._emit(f"NEXT {basic_var}")
+        next_ln = self._emit(f"NEXT {basic_var}")
+        # continue skips the rest of the body and runs the NEXT.
+        for cln in frame["continues"]:
+            self._emit_at(cln, f"GOTO {next_ln}")
 
         after_ln = self.lines.peek()
         if guard_ln is not None or frame["lines"]:
@@ -1353,24 +1985,40 @@ class Transpiler(ast.NodeVisitor):
             self.dialect.emit_break(node)
 
     def visit_Continue(self, node):
-        raise TranspilerError(
-            "continue not supported. Restructure using an if/else guard.", node.lineno
-        )
+        if not self._break_frames:
+            raise TranspilerError("continue outside loop", node.lineno)
+        ln = self.lines.next()
+        self.emitter.emit(ln, "GOTO 0")  # placeholder, backfilled by the loop
+        self._break_frames[-1]["continues"].append(ln)
 
     def visit_Pass(self, _node):
         self._emit("REM")
 
     def visit_Import(self, node):
         for alias in node.names:
-            if alias.name not in {"time", "sys", "math"}:
+            if alias.name not in {
+                "time",
+                "sys",
+                "math",
+                "random",
+                "py2basic_runtime",
+            }:
                 raise TranspilerError(
                     f"import {alias.name} not supported.", node.lineno
                 )
             if alias.name == "math":
                 self._math_aliases.add(alias.asname or "math")
+            if alias.name == "random":
+                self._random_aliases.add(alias.asname or "random")
 
     def visit_ImportFrom(self, node):
-        if node.module not in {"time", "sys", "math"}:
+        if node.module not in {
+            "time",
+            "sys",
+            "math",
+            "random",
+            "py2basic_runtime",
+        }:
             raise TranspilerError(
                 f"from {node.module} import ... not supported.", node.lineno
             )

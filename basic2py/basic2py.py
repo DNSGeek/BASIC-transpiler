@@ -36,6 +36,7 @@ import re
 import sys
 import textwrap
 from dataclasses import dataclass
+from typing import ClassVar
 
 # ── String-literal-aware helpers ───────────────────────────────────────────────
 
@@ -100,18 +101,25 @@ class BasicLine:
 class VarMapper:
     """
     Maps BASIC variable names to Python names.
-    A   -> a
-    A$  -> a_str
-    A0  -> a0
-    A0$ -> a0_str
+    A     -> a
+    A$    -> a_str
+    A0    -> a0
+    A0$   -> a0_str
+    A()   -> a_arr
+    A$()  -> a_str_arr
+
+    Arrays get the `_arr` suffix because in Commodore BASIC `A` and `A(0)`
+    are *different* variables. Mapping both to `a` silently fuses them, and
+    the recovered program then fails with a TypeError.
     """
 
     def __init__(self):
         self._cache = {}
 
-    def map(self, basic_name: str) -> str:
-        if basic_name in self._cache:
-            return self._cache[basic_name]
+    def map(self, basic_name: str, is_array: bool = False) -> str:
+        key = (basic_name, is_array)
+        if key in self._cache:
+            return self._cache[key]
 
         name = basic_name.strip()
         is_string = name.endswith("$")
@@ -122,8 +130,10 @@ class VarMapper:
         py_name = name.lower()
         if is_string:
             py_name += "_str"
+        if is_array:
+            py_name += "_arr"
 
-        self._cache[basic_name] = py_name
+        self._cache[key] = py_name
         return py_name
 
 
@@ -133,11 +143,88 @@ class VarMapper:
 class ExprConverter:
     """Converts BASIC expressions to Python expressions."""
 
+    #: BASIC function -> Python equivalent, applied as a plain rename.
+    SIMPLE_FUNCTIONS: ClassVar[tuple] = (
+        (r"STR\$", "str"),
+        (r"CHR\$", "chr"),
+        (r"HEX\$", "hex"),
+        ("ASC", "ord"),
+        ("LEN", "len"),
+        ("INT", "int"),
+        ("ABS", "abs"),
+        ("VAL", "float"),
+        ("SQR", "math.sqrt"),
+        ("SIN", "math.sin"),
+        ("COS", "math.cos"),
+        ("TAN", "math.tan"),
+        ("ATN", "math.atan"),
+        ("LOG", "math.log"),
+        ("EXP", "math.exp"),
+        ("RND", "_rnd"),
+        ("SGN", "_sgn"),
+        ("PEEK", "_peek"),
+        ("DEC", "_dec"),
+        ("FRE", "_fre"),
+        ("POS", "_pos"),
+        ("TAB", "_tab"),
+        ("SPC", "_spc"),
+    )
+
+    #: Runtime shims emitted when the program uses one of these.
+    SHIMS: ClassVar[dict] = {
+        "_rnd": "def _rnd(_x=1):\n    return random.random()",
+        "_sgn": "def _sgn(x):\n    return (x > 0) - (x < 0)",
+        "_peek": "def _peek(_addr):\n    return 0  # TODO: no memory to read",
+        "_dec": "def _dec(s):\n    return int(s, 16)",
+        "_fre": "def _fre(_x=0):\n    return 0  # TODO: no BASIC heap",
+        "_pos": "def _pos(_x=0):\n    return 0  # TODO: cursor column unknown",
+        "_tab": "def _tab(n):\n    return ' ' * int(n)",
+        "_spc": "def _spc(n):\n    return ' ' * int(n)",
+    }
+
     #: CHR$(34) — the BASIC idiom for a double quote inside a string.
     _CHR34 = r"(?:CHR\$|chr)\s*\(\s*34\s*\)"
 
     def __init__(self, var_mapper: VarMapper):
         self.vm = var_mapper
+        #: BASIC names known to be arrays, from DIM. A(1) is a subscript,
+        #: not a call, so the variable mapper has to be told the difference.
+        self.arrays = set()
+
+    def _convert_substring(self, expr: str) -> str:
+        """LEFT$/RIGHT$/MID$ -> Python slices."""
+        expr = re.sub(
+            r"\bLEFT\$\s*\(([^,]+),\s*([^)]+)\)",
+            lambda m: f"({self.convert(m.group(1))})[:{self.convert(m.group(2))}]",
+            expr,
+            flags=re.IGNORECASE,
+        )
+        expr = re.sub(
+            r"\bRIGHT\$\s*\(([^,]+),\s*([^)]+)\)",
+            lambda m: f"({self.convert(m.group(1))})[-({self.convert(m.group(2))}):]",
+            expr,
+            flags=re.IGNORECASE,
+        )
+        # MID$(s, start, len) and the two-argument MID$(s, start).
+        expr = re.sub(
+            r"\bMID\$\s*\(([^,]+),\s*([^,)]+),\s*([^)]+)\)",
+            lambda m: (
+                f"({self.convert(m.group(1))})"
+                f"[({self.convert(m.group(2))}) - 1:"
+                f"({self.convert(m.group(2))}) - 1 + ({self.convert(m.group(3))})]"
+            ),
+            expr,
+            flags=re.IGNORECASE,
+        )
+        expr = re.sub(
+            r"\bMID\$\s*\(([^,]+),\s*([^)]+)\)",
+            lambda m: (
+                f"({self.convert(m.group(1))})" f"[({self.convert(m.group(2))}) - 1:]"
+            ),
+            expr,
+            flags=re.IGNORECASE,
+        )
+        return expr
 
     def _convert_chr34(self, expr: str) -> str:
         """
@@ -218,31 +305,50 @@ class ExprConverter:
 
         return expr
 
+    def _convert_arrays(self, expr: str) -> str:
+        """A(3) -> a[3] for every name that appeared in a DIM."""
+        if not self.arrays:
+            return expr
+        names = sorted(self.arrays, key=len, reverse=True)
+        pattern = r"\b(" + "|".join(re.escape(n) for n in names) + r")\s*\(([^()]*)\)"
+        return re.sub(
+            pattern,
+            lambda m: (
+                f"{self.vm.map(m.group(1), is_array=True)}"
+                f"[{self.convert(m.group(2))}]"
+            ),
+            expr,
+            flags=re.IGNORECASE,
+        )
+
     def convert(self, expr: str) -> str:
         expr = expr.strip()
 
         # String concatenation: " + CHR$(34) + " patterns
         expr = self._convert_chr34(expr)
 
-        # Function conversions (order matters - most specific first)
-        expr = re.sub(r"\bSTR\$\s*\(", "str(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bCHR\$\s*\(", "chr(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bASC\s*\(", "ord(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bLEN\s*\(", "len(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bINT\s*\(", "int(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bABS\s*\(", "abs(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bSQR\s*\(", "math.sqrt(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bSIN\s*\(", "math.sin(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bCOS\s*\(", "math.cos(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bTAN\s*\(", "math.tan(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bATN\s*\(", "math.atan(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bLOG\s*\(", "math.log(", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bEXP\s*\(", "math.exp(", expr, flags=re.IGNORECASE)
+        # Two-argument string functions, before the simple renames so the
+        # argument split still sees the original commas.
+        expr = self._convert_substring(expr)
+
+        # Simple renames. Order matters — most specific first.
+        for basic_fn, py_fn in self.SIMPLE_FUNCTIONS:
+            expr = re.sub(rf"\b{basic_fn}\s*\(", f"{py_fn}(", expr, flags=re.IGNORECASE)
         expr = re.sub(
             r"\bUPPER\$\s*\(([^)]+)\)", r"(\1).upper()", expr, flags=re.IGNORECASE
         )
         expr = re.sub(
             r"\bLOWER\$\s*\(([^)]+)\)", r"(\1).lower()", expr, flags=re.IGNORECASE
+        )
+        # INSTR(hay, needle) is 1-based and 0 when absent; .find() is
+        # 0-based and -1, so the offset lines up exactly.
+        expr = re.sub(
+            r"\bINSTR\s*\(([^,]+),\s*([^)]+)\)",
+            lambda m: (
+                f"({self.convert(m.group(1))}).find" f"({self.convert(m.group(2))}) + 1"
+            ),
+            expr,
+            flags=re.IGNORECASE,
         )
 
         # MOD(a, b) -> (a) % (b)
@@ -259,6 +365,10 @@ class ExprConverter:
         expr = re.sub(r"\bOR\b", "or", expr, flags=re.IGNORECASE)
         expr = re.sub(r"\bNOT\b", "not", expr, flags=re.IGNORECASE)
         expr = re.sub(r"<>", "!=", expr)
+
+        # Array subscripts, before variable mapping — the mapper skips any
+        # name followed by "(", assuming it is a function call.
+        expr = self._convert_arrays(expr)
 
         # Map variable names (after function conversion to avoid clobbering)
         expr = self._map_vars_in_expr(expr)
@@ -399,18 +509,114 @@ class CFGAnalyser:
 
 
 class Transpiler:
+
+    #: Names that may legitimately survive expression conversion.
+    KNOWN_NAMES = frozenset(
+        {
+            "abs",
+            "chr",
+            "float",
+            "hex",
+            "int",
+            "len",
+            "ord",
+            "str",
+            "input",
+            "print",
+            "range",
+            "and",
+            "or",
+            "not",
+            "if",
+            "else",
+            "for",
+            "in",
+            "while",
+            "break",
+            "def",
+            "return",
+            "end",
+            "math",
+            "time",
+            "sys",
+            "random",
+            "_rnd",
+            "_sgn",
+            "_peek",
+            "_dec",
+            "_fre",
+            "_pos",
+            "_tab",
+            "_spc",
+            "_read",
+            "_restore",
+        }
+    )
+
     def __init__(self):
         self.vm = VarMapper()
         self.ec = ExprConverter(self.vm)
         self.output_lines = []
         self._indent = 0
-        self._needs_math = False
-        self._needs_time = False
         self._needs_sys = False
+        self._needs_data = False
+        self._data_items = []
+        self._unknown_calls = set()
+        #: Jump targets that mean break/continue inside the enclosing loop.
+        self._loop_stack = []
+
+    def _flag_unknown_calls(self, text: str):
+        """
+        Warn about calls this converter did not recognise.
+
+        Without this a BASIC function with no mapping survives as a bare
+        name — `a = PEEK(1024)` parses cleanly and then raises NameError at
+        runtime, which is worse than an honest TODO.
+        """
+        for m in re.finditer(r"\b([A-Za-z_][A-Za-z_0-9.]*)\s*\(", text):
+            name = m.group(1)
+            if name in self.KNOWN_NAMES or name.startswith("math."):
+                continue
+            if name.split(".")[0] in self.KNOWN_NAMES:
+                continue
+            self._unknown_calls.add(name)
 
     def _emit(self, text: str = ""):
         prefix = "    " * self._indent
+        stripped = text.lstrip()
+        if not stripped.startswith("#"):
+            self._flag_unknown_calls(text)
         self.output_lines.append(prefix + text)
+
+    def _loop_keyword(self, target):
+        """`break` or `continue` if target is a landmark of the current loop."""
+        if not self._loop_stack:
+            return None
+        # Only the innermost loop can be left with a bare GOTO.
+        frame = self._loop_stack[-1]
+        if target == frame.get("continue"):
+            return "continue"
+        if target == frame.get("break"):
+            return "break"
+        return None
+
+    def _open_block(self):
+        """Mark the start of an indented block. Pair with _close_block()."""
+        self._indent += 1
+        return len(self.output_lines)
+
+    def _close_block(self, mark):
+        """
+        Close an indented block, adding `pass` if nothing substantive landed
+        in it. A block holding only TODO comments is an IndentationError.
+        """
+        substantive = any(
+            out.strip() and not out.strip().startswith("#")
+            for out in self.output_lines[mark:]
+        )
+        if not substantive:
+            self._emit("pass")
+        self._indent -= 1
 
     def _emit_comment(self, text: str):
         self._emit(f"# {text}")
@@ -418,23 +624,134 @@ class Transpiler:
     def _emit_todo(self, text: str):
         self._emit(f"# TODO: {text}")
 
+    @staticmethod
+    def _split_then_else(stmt: str):
+        """Split a single-line THEN clause at a top-level ELSE."""
+        parts = split_outside_strings(stmt, ":")
+        for index, part in enumerate(parts):
+            if re.match(r"^ELSE\b", upper_outside_strings(part)):
+                tail = re.sub(r"^ELSE\s*", "", part, count=1, flags=re.IGNORECASE)
+                rest = ([tail] if tail.strip() else []) + parts[index + 1 :]
+                return parts[:index], rest
+        return parts, None
+
+    def _emit_inline(self, statements, line_number, cfg):
+        """Emit colon-separated statements as an indented block."""
+        block = [
+            BasicLine(
+                number=line_number,
+                text=upper_outside_strings(s),
+                original=s,
+            )
+            for s in statements
+            if s.strip()
+        ]
+        if block:
+            self._emit_block(block, cfg, 0)
+
+    def _assign_target(self, target: str) -> str:
+        """A READ/INPUT destination, which may be an array element."""
+        target = target.strip()
+        m = re.match(r"^([A-Z][0-9]?\$?)\s*\((.+)\)$", target, re.IGNORECASE)
+        if m:
+            name = self.vm.map(m.group(1), is_array=True)
+            return f"{name}[{self.ec.convert(m.group(2))}]"
+        return self.vm.map(target)
+
+    @staticmethod
+    def _split_data(items: str) -> list:
+        """DATA operands: bare words are strings, numbers stay numbers."""
+        out = []
+        for raw in split_outside_strings(items, ","):
+            raw = raw.strip()
+            if raw.startswith('"') and raw.endswith('"'):
+                out.append(raw)
+                continue
+            try:
+                float(raw)
+            except ValueError:
+                out.append(f'"{raw}"')
+            else:
+                out.append(raw)
+        return out
+
+    def _emit_dim(self, spec: str):
+        """DIM a(n) -> a = [0] * (n + 1); BASIC subscripts run 0..n."""
+        for decl in split_outside_strings(spec, ","):
+            m = re.match(r"^([A-Z][0-9]?\$?)\s*\((.+)\)$", decl.strip(), re.IGNORECASE)
+            if not m:
+                self._emit_todo(f"Unrecognised DIM: {decl.strip()}")
+                continue
+            name = m.group(1)
+            var = self.vm.map(name, is_array=True)
+            size = self.ec.convert(m.group(2))
+            fill = '""' if name.rstrip().endswith("$") else "0"
+            try:
+                count = str(int(float(size)) + 1)
+            except ValueError:
+                count = f"({size}) + 1"
+            self._emit(f"{var} = [{fill}] * {count}")
+
+    def _emit_on_branch(self, m, cfg, i):
+        """ON x GOTO/GOSUB n1, n2, ... -> an if/elif ladder."""
+        selector = self.ec.convert(m.group(1))
+        is_gosub = m.group(2).upper() == "GOSUB"
+        targets = [t.strip() for t in m.group(3).split(",") if t.strip()]
+        for index, target in enumerate(targets, start=1):
+            keyword = "if" if index == 1 else "elif"
+            self._emit(f"{keyword} {selector} == {index}:")
+            mark = self._open_block()
+            if is_gosub:
+                num = int(target)
+                name = cfg.func_name_at(num) or f"sub_{num}"
+                self._emit(f"{name}()")
+            else:
+                self._emit_todo(f"GOTO {target} — unresolved computed jump")
+            self._close_block(mark)
+        return i + 1
+
     def _emit_imports(self, lines):
         """Scan for needed imports and emit them."""
         # Skip REM lines — prose mentioning "END" is not a statement.
         code = [ln.text for ln in lines if not re.match(r"^REM\b", ln.text)]
         src = " ".join(code)
-        needs_math = bool(
-            re.search(r"\b(SQR|SIN|COS|TAN|ATN|LOG|EXP)\s*\(", src, re.IGNORECASE)
-        )
-        needs_time = bool(re.search(r"\bSLEEP\b", src, re.IGNORECASE))
-        needs_sys = any(re.match(r"^END\s*$", stmt) for stmt in code)
+        body = "\n".join(self.output_lines)
 
-        if needs_math:
+        if re.search(r"\b(SQR|SIN|COS|TAN|ATN|LOG|EXP)\s*\(", src, re.IGNORECASE):
             self._emit("import math")
-        if needs_time:
+        if re.search(r"\b(RND|randint|random)\b", src + body, re.IGNORECASE):
+            self._emit("import random")
+        if re.search(r"\bSLEEP\b", src, re.IGNORECASE):
             self._emit("import time")
-        if needs_sys:
+        if self._needs_sys or any(re.match(r"^(END|STOP)\s*$", stmt) for stmt in code):
             self._emit("import sys")
+
+    def _emit_runtime(self, body: str):
+        """Emit the small shims the converted code depends on."""
+        used = [name for name in self.ec.SHIMS if re.search(rf"\b{name}\(", body)]
+        if used or self._needs_data:
+            self._emit()
+            self._emit("# ── BASIC runtime shims " + "─" * 45)
+        for name in used:
+            self._emit()
+            for shim_line in self.ec.SHIMS[name].splitlines():
+                self._emit(shim_line)
+        if self._needs_data:
+            self._emit()
+            items = ", ".join(self._data_items) if self._data_items else ""
+            self._emit(f"_DATA = [{items}]")
+            self._emit("_data_pos = 0")
+            self._emit("")
+            self._emit("")
+            self._emit("def _read():")
+            self._emit("    global _data_pos")
+            self._emit("    _data_pos += 1")
+            self._emit("    return _DATA[_data_pos - 1]")
+            self._emit("")
+            self._emit("")
+            self._emit("def _restore():")
+            self._emit("    global _data_pos")
+            self._emit("    _data_pos = 0")
 
     def _split_subroutines(self, lines, cfg):
         """
@@ -618,6 +935,102 @@ class Transpiler:
                 i += 1
                 continue
 
+            # STOP
+            if re.match(r"^STOP\s*$", text):
+                self._emit("sys.exit()  # STOP")
+                self._needs_sys = True
+                i += 1
+                continue
+
+            # POKE addr, value
+            m = re.match(r"^POKE\s+([^,]+),\s*(.+)$", text, re.IGNORECASE)
+            if m:
+                addr = self.ec.convert(m.group(1))
+                val = self.ec.convert(m.group(2))
+                self._emit_todo(f"POKE {addr}, {val} — no memory to write")
+                i += 1
+                continue
+
+            # SYS addr
+            m = re.match(r"^SYS\s+(.+)$", text, re.IGNORECASE)
+            if m:
+                self._emit_todo(
+                    f"SYS {self.ec.convert(m.group(1))} — machine code call"
+                )
+                i += 1
+                continue
+
+            # WAIT addr, mask [, xor]
+            m = re.match(r"^WAIT\s+(.+)$", text, re.IGNORECASE)
+            if m:
+                self._emit_todo(f"WAIT {m.group(1)} — hardware poll")
+                i += 1
+                continue
+
+            # DIM a(n) [, b(m) ...]
+            m = re.match(r"^DIM\s+(.+)$", text, re.IGNORECASE)
+            if m:
+                self._emit_dim(m.group(1))
+                i += 1
+                continue
+
+            # DATA a, b, c
+            m = re.match(r"^DATA\s*(.*)$", text, re.IGNORECASE)
+            if m:
+                self._data_items.extend(self._split_data(m.group(1)))
+                i += 1
+                continue
+
+            # READ var [, var ...]
+            m = re.match(r"^READ\s+(.+)$", text, re.IGNORECASE)
+            if m:
+                for target in split_outside_strings(m.group(1), ","):
+                    self._emit(f"{self._assign_target(target)} = _read()")
+                self._needs_data = True
+                i += 1
+                continue
+
+            # RESTORE
+            if re.match(r"^RESTORE\s*$", text):
+                self._emit("_restore()")
+                self._needs_data = True
+                i += 1
+                continue
+
+            # GET var  /  GETKEY var
+            m = re.match(r"^GET(KEY)?\s+([A-Z][0-9]?\$?)$", text, re.IGNORECASE)
+            if m:
+                var = self.vm.map(m.group(2))
+                if m.group(1):
+                    self._emit(f"{var} = input()[:1]  # GETKEY (waits)")
+                else:
+                    self._emit(f"{var} = ''  # TODO: GET — non-blocking key read")
+                i += 1
+                continue
+
+            # DEF FNx(p) = expr
+            m = re.match(
+                r"^DEF\s+FN\s*([A-Z][0-9]?)\s*\(\s*([A-Z][0-9]?)\s*\)\s*=\s*(.+)$",
+                text,
+                re.IGNORECASE,
+            )
+            if m:
+                name = f"fn{m.group(1).lower()}"
+                param = self.vm.map(m.group(2))
+                body = self.ec.convert(m.group(3))
+                self._emit(f"def {name}({param}):")
+                self._indent += 1
+                self._emit(f"return {body}")
+                self._indent -= 1
+                i += 1
+                continue
+
+            # ON x GOTO/GOSUB n1, n2, ...
+            m = re.match(r"^ON\s+(.+?)\s+(GOTO|GOSUB)\s+(.+)$", text, re.IGNORECASE)
+            if m:
+                i = self._emit_on_branch(m, cfg, i)
+                continue
+
             # FOR loop
             m = re.match(
                 r"^FOR\s+([A-Z][0-9]?)\s*=\s*(.+?)\s+TO\s+(.+?)(?:\s+STEP\s+(.+))?$",
@@ -678,32 +1091,32 @@ class Transpiler:
             ):
                 cond = self.ec.convert_condition(m.group(1))
                 stmt = m.group(2).strip()
+
+                # BASIC 7.0/65 allow `IF c THEN a : ELSE b` on one line.
+                then_part, else_part = self._split_then_else(stmt)
+
                 self._emit(f"if {cond}:")
-                self._indent += 1
-                # The THEN clause can hold several colon-separated statements.
-                consequent = [
-                    BasicLine(
-                        number=line.number,
-                        text=upper_outside_strings(s),
-                        original=s,
-                    )
-                    for s in split_outside_strings(stmt, ":")
-                ]
-                if consequent:
-                    self._emit_block(consequent, cfg, 0)
-                else:
-                    self._emit("pass")
-                self._indent -= 1
+                mark = self._open_block()
+                self._emit_inline(then_part, line.number, cfg)
+                self._close_block(mark)
+                if else_part is not None:
+                    self._emit("else:")
+                    mark = self._open_block()
+                    self._emit_inline(else_part, line.number, cfg)
+                    self._close_block(mark)
                 i += 1
                 continue
 
-            # GOTO n — try to identify as while-loop back edge, else TODO
+            # GOTO n — a jump to one of the enclosing loop's landmarks is a
+            # break or a continue; anything else stays a TODO.
             m = re.match(r"^GOTO\s+(\d+)$", text)
             if m:
                 target = int(m.group(1))
-                # If it jumps backward it might be a while back-edge (already handled)
-                # If it jumps forward it's a skip — might be else end
-                self._emit_todo(f"GOTO {target} — unresolved jump")
+                keyword = self._loop_keyword(target)
+                if keyword:
+                    self._emit(keyword)
+                else:
+                    self._emit_todo(f"GOTO {target} — unresolved jump")
                 i += 1
                 continue
 
@@ -718,6 +1131,20 @@ class Transpiler:
             m = re.match(r"^INPUT\s+(.+)$", text, re.IGNORECASE)
             if m:
                 self._emit_input(m.group(1).strip())
+                i += 1
+                continue
+
+            # Array element assignment: A(3) = 5
+            m = re.match(
+                r"^(?:LET\s+)?([A-Z][0-9]?\$?\s*\(.+\))\s*=\s*([^=].*)$",
+                text,
+                re.IGNORECASE,
+            )
+            if m:
+                self._emit(
+                    f"{self._assign_target(m.group(1))} "
+                    f"= {self.ec.convert(m.group(2))}"
+                )
                 i += 1
                 continue
 
@@ -746,6 +1173,16 @@ class Transpiler:
 
         cfg = CFGAnalyser(lines)
 
+        # Arrays have to be known before any expression is converted.
+        for line in lines:
+            m = re.match(r"^DIM\s+(.+)$", line.text, re.IGNORECASE)
+            if not m:
+                continue
+            for decl in split_outside_strings(m.group(1), ","):
+                dm = re.match(r"^([A-Z][0-9]?\$?)\s*\(", decl.strip(), re.IGNORECASE)
+                if dm:
+                    self.ec.arrays.add(dm.group(1).upper())
+
         # Split into main body and subroutines
         main_lines, subroutines = self._split_subroutines(lines, cfg)
 
@@ -765,24 +1202,38 @@ class Transpiler:
             self._indent = 0
             func_name = cfg.func_name_at(sub_start) or f"sub_{sub_start}"
             self._emit(f"def {func_name}():")
-            self._indent = 1
+            mark = self._open_block()
             self._emit_block(sub_body, cfg)
-            self._indent = 0
+            self._close_block(mark)
             self._emit()
             sub_lines_collected.extend(self.output_lines)
 
         self.output_lines = saved_output
 
-        # Now we know what imports we need — emit them
+        # Emit the main body into a buffer too, so the preamble can be
+        # built once everything it depends on is known.
+        saved_output = self.output_lines
+        self.output_lines = []
+        self._emit_block(main_lines, cfg)
+        main_collected = self.output_lines
+        self.output_lines = saved_output
+
+        body = "\n".join(sub_lines_collected + main_collected)
+
+        # Now we know what imports and shims we need — emit them
         self._emit_imports(lines)
+        self._emit_runtime(body)
         self._emit()
 
-        # Emit subroutine definitions
-        for line in sub_lines_collected:
-            self.output_lines.append(line)
+        if self._unknown_calls:
+            self._emit(
+                "# TODO: unconverted BASIC calls: "
+                + ", ".join(sorted(self._unknown_calls))
+            )
+            self._emit()
 
-        # Emit main code
-        self._emit_block(main_lines, cfg)
+        self.output_lines.extend(sub_lines_collected)
+        self.output_lines.extend(main_collected)
 
         return "\n".join(self.output_lines) + "\n"
 
@@ -824,24 +1275,21 @@ class Transpiler:
         end_target = int(m.group(2))
         top_num = top_line.number
 
-        # Collect body: lines after the IF NOT until we find GOTO top_num
+        # Collect every line up to the loop's exit target. The back edge is
+        # the LAST `GOTO top`; earlier ones are continues, so stopping at the
+        # first would truncate the body.
         body = []
         j = i + 2
-        found_goto_top = False
-
-        while j < len(lines):
-            if lines[j].number >= end_target:
-                break
-            bm = re.match(r"^GOTO\s+(\d+)$", lines[j].text)
-            if bm and int(bm.group(1)) == top_num:
-                found_goto_top = True
-                j += 1
-                break
+        while j < len(lines) and lines[j].number < end_target:
             body.append(lines[j])
             j += 1
 
-        if not found_goto_top:
+        if not body:
             return None
+        back_edge = re.match(r"^GOTO\s+(\d+)$", body[-1].text)
+        if not back_edge or int(back_edge.group(1)) != top_num:
+            return None
+        body.pop()
 
         cond = self.ec.convert_condition(cond_text)
         # Fix = -> == in condition
@@ -849,12 +1297,14 @@ class Transpiler:
         cond = re.sub(r"===", "==", cond)
 
         self._emit(f"while {cond}:")
-        self._indent += 1
+        mark = self._open_block()
+        # Jumping to the top re-tests the condition (continue); jumping to
+        # the exit target leaves the loop (break).
+        self._loop_stack.append({"continue": top_num, "break": end_target})
         if body:
             self._emit_block(body, cfg)
-        else:
-            self._emit("pass")
-        self._indent -= 1
+        self._loop_stack.pop()
+        self._close_block(mark)
         return j
 
     def _emit_for(self, lines, i, m, cfg):
@@ -868,12 +1318,15 @@ class Transpiler:
         # Collect body until NEXT (the variable name is optional in BASIC)
         i += 1
         body = []
+        next_number = None
         while i < len(lines):
             if re.match(rf"^NEXT(\s+{var_basic})?\s*$", lines[i].text, re.IGNORECASE):
+                next_number = lines[i].number
                 i += 1
                 break
             body.append(lines[i])
             i += 1
+        after_number = lines[i].number if i < len(lines) else None
 
         # BASIC's TO bound is inclusive, Python's range() stop is exclusive.
         # Which way to nudge it depends on the direction of travel: a
@@ -901,19 +1354,13 @@ class Transpiler:
             range_expr = f"range({start}, {stop_expr})"
 
         self._emit(f"for {var_py} in {range_expr}:")
-        self._indent += 1
-        before = len(self.output_lines)
+        mark = self._open_block()
+        # A GOTO to the NEXT is a continue; one to the line past it, a break.
+        self._loop_stack.append({"continue": next_number, "break": after_number})
         if body:
             self._emit_block(body, cfg)
-        # If nothing substantive was emitted, add pass
-        substantive = [
-            out
-            for out in self.output_lines[before:]
-            if out.strip() and not out.strip().startswith("#")
-        ]
-        if not substantive:
-            self._emit("pass")
-        self._indent -= 1
+        self._loop_stack.pop()
+        self._close_block(mark)
         return i
 
     def _loop_condition(self, keyword: str, expr: str) -> str:
@@ -933,6 +1380,7 @@ class Transpiler:
         body = []
         depth = 1
         tail = None
+        loop_number = None
 
         while i < len(lines):
             text = lines[i].text
@@ -947,6 +1395,7 @@ class Transpiler:
                 if depth == 0:
                     if m.group(1):
                         tail = (m.group(1), m.group(2))
+                    loop_number = lines[i].number
                     i += 1
                     break
                 body.append(lines[i])
@@ -954,40 +1403,45 @@ class Transpiler:
                 continue
             body.append(lines[i])
             i += 1
+        after_number = lines[i].number if i < len(lines) else None
+        frame = {"continue": loop_number, "break": after_number}
 
         if head is not None:
             self._emit(f"while {self._loop_condition(*head)}:")
-            self._indent += 1
+            mark = self._open_block()
+            self._loop_stack.append(frame)
             if body:
                 self._emit_block(body, cfg)
-            else:
-                self._emit("pass")
-            self._indent -= 1
+            self._loop_stack.pop()
+            self._close_block(mark)
         elif tail is not None:
             # Bottom-tested: run the body, then repeat while the condition holds.
             self._emit("while True:")
-            self._indent += 1
+            mark = self._open_block()
+            self._loop_stack.append(frame)
             if body:
                 self._emit_block(body, cfg)
+            self._loop_stack.pop()
             self._emit(f"if not ({self._loop_condition(*tail)}):")
-            self._indent += 1
+            inner = self._open_block()
             self._emit("break")
-            self._indent -= 2
+            self._close_block(inner)
+            self._close_block(mark)
         else:
             self._emit("while True:")
-            self._indent += 1
+            mark = self._open_block()
+            self._loop_stack.append(frame)
             if body:
                 self._emit_block(body, cfg)
-            else:
-                self._emit("pass")
-            self._indent -= 1
+            self._loop_stack.pop()
+            self._close_block(mark)
         return i
 
     def _emit_begin_bend_if(self, lines, i, cond_text, cfg):
         """Emit a BEGIN/BEND structured if block (BASIC 65/7.0)."""
         cond = self.ec.convert_condition(cond_text)
         self._emit(f"if {cond}:")
-        self._indent += 1
+        mark = self._open_block()
         i += 1
 
         body = []
@@ -1006,11 +1460,9 @@ class Transpiler:
                 # Emit the if body, then start else
                 if body:
                     self._emit_block(body, cfg)
-                else:
-                    self._emit("pass")
-                self._indent -= 1
+                self._close_block(mark)
                 self._emit("else:")
-                self._indent += 1
+                mark = self._open_block()
                 body = []
                 i += 1
             elif re.match(r"^BEND\s*$", text, re.IGNORECASE):
@@ -1018,9 +1470,7 @@ class Transpiler:
                 if depth == 0:
                     if body:
                         self._emit_block(body, cfg)
-                    else:
-                        self._emit("pass")
-                    self._indent -= 1
+                    self._close_block(mark)
                     i += 1
                     break
                 else:
@@ -1065,9 +1515,11 @@ class Transpiler:
             if lnum >= skip_target:
                 break
 
-            # Check for GOTO at end of body (skip-else jump)
+            # A GOTO at the end of the body is the skip-else jump — unless
+            # it targets an enclosing loop, in which case it is a break or a
+            # continue and belongs in the body.
             goto_m = re.match(r"^GOTO\s+(\d+)$", text)
-            if goto_m:
+            if goto_m and not self._loop_keyword(int(goto_m.group(1))):
                 skip_goto_target = int(goto_m.group(1))
                 found_skip_goto = True
                 i += 1
@@ -1077,12 +1529,10 @@ class Transpiler:
             i += 1
 
         self._emit(f"if {cond}:")
-        self._indent += 1
+        mark = self._open_block()
         if body:
             self._emit_block(body, cfg)
-        else:
-            self._emit("pass")
-        self._indent -= 1
+        self._close_block(mark)
 
         if found_skip_goto and skip_goto_target:
             # Collect else body: from skip_target to skip_goto_target
@@ -1092,9 +1542,9 @@ class Transpiler:
 
             if else_body:
                 self._emit("else:")
-                self._indent += 1
+                mark = self._open_block()
                 self._emit_block(else_body, cfg)
-                self._indent -= 1
+                self._close_block(mark)
 
         return i
 

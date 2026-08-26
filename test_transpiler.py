@@ -100,14 +100,13 @@ for b65 in (False, True):
     )
     test("function params rejected", "def f(a): pass", should_fail=True, basic65=b65)
     test("return value rejected", "def f():\n return 1", should_fail=True, basic65=b65)
-    test("list rejected", "x=[1,2]", should_fail=True, basic65=b65)
+    test("list becomes DIM", "x=[1,2]", ["DIM A(1)"], basic65=b65)
     test("dict rejected", "x={'a':1}", should_fail=True, basic65=b65)
     test("class rejected", "class F: pass", should_fail=True, basic65=b65)
     test("try rejected", "try:\n pass\nexcept: pass", should_fail=True, basic65=b65)
     test(
-        "continue rejected",
+        "continue supported",
         "i=0\nwhile i<10:\n i+=1\n continue",
-        should_fail=True,
         basic65=b65,
     )
     test(
@@ -157,7 +156,10 @@ test(
 test("B20 assert", "x=5\nassert x>0", ["IF (A > 0) THEN GOTO", "END"], basic65=False)
 
 test(
-    "B20 sleep rejected", "import time\ntime.sleep(1)", should_fail=True, basic65=False
+    "B20 sleep becomes a delay loop",
+    "import time\ntime.sleep(1)",
+    ["FOR ", " TO 1000", "NEXT "],
+    basic65=False,
 )
 
 
@@ -270,7 +272,7 @@ test7("modulo", "x = 7 % 3", ["- INT("])
 test7("aug mod", "x=7\nx%=3", ["- INT("])
 
 # No SLEEP like B20
-test7("sleep rejected", "import time\ntime.sleep(1)", should_fail=True)
+test7("sleep becomes a delay loop", "import time\ntime.sleep(1)", ["FOR ", "NEXT "])
 
 # Shared basics still work
 test7("for loop", "for i in range(5):\n print(i)", ["FOR", "= 0 TO 4", "NEXT"])
@@ -631,6 +633,302 @@ check(
 check(
     "B70 modulo of atoms", "x=7\nx%=3", dialect="B70", contains=["A - INT(A / 3) * 3"]
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Keyword support
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── VAL: int()/float() of a string is not INT() ────────────────────────────
+check_all(
+    "int of a string uses VAL",
+    'n = "42"\nx = int(n)',
+    contains=["INT(VAL(A$))"],
+    absent=["INT(A$)"],
+)
+check_all("float of a string uses VAL", 'n = "42"\nx = float(n)', contains=["VAL(A$)"])
+check_all(
+    "int of a number is unchanged",
+    "x = int(3.7)",
+    contains=["INT(3.7)"],
+    absent=["VAL("],
+)
+
+# ── String slicing -> LEFT$ / RIGHT$ / MID$ ───────────────────────────────
+check_all("slice to LEFT$", 's = "hello"\nt = s[:3]', contains=["LEFT$(A$, 3)"])
+check_all("slice to RIGHT$", 's = "hello"\nt = s[-3:]', contains=["RIGHT$(A$, 3)"])
+check_all("slice to MID$", 's = "hello"\nt = s[1:4]', contains=["MID$(A$, 2, 3)"])
+check_all(
+    "open-ended slice to MID$", 's = "hello"\nt = s[2:]', contains=["MID$(A$, 3)"]
+)
+check_all("index to MID$", 's = "hello"\nt = s[1]', contains=["MID$(A$, 2, 1)"])
+check_all(
+    "negative index to MID$",
+    's = "hello"\nt = s[-1]',
+    contains=["MID$(A$, LEN(A$), 1)"],
+)
+check_all(
+    "slice from the end", 's = "hello"\nt = s[:-1]', contains=["LEFT$(A$, LEN(A$) - 1)"]
+)
+check_all("full slice is the string", 's = "hello"\nt = s[:]', contains=["B$ = A$"])
+check_all(
+    "variable slice bounds",
+    's = "hello"\na=1\nb=3\nt = s[a:b]',
+    contains=["MID$(A$, A + 1, B - A)"],
+)
+check_all("slice step rejected", 's = "hi"\nt = s[::2]', should_fail=True)
+check_all(
+    "sliced value is still a string",
+    's = "hello"\nt = s[:2]\nu = t + "x"',
+    contains=["C$ ="],
+)
+
+# ── Arrays -> DIM ─────────────────────────────────────────────────────────
+check_all(
+    "list literal dims and fills",
+    "xs = [1, 2, 3]",
+    contains=["DIM A(2)", "A(0) = 1", "A(2) = 3"],
+)
+check_all(
+    "repeat list dims only", "xs = [0] * 4", contains=["DIM A(3)"], absent=["A(0) = 0"]
+)
+check_all("non-zero fill loops", "xs = [7] * 3", contains=["DIM A(2)", "FOR ", "NEXT "])
+check_all("string list", 'xs = ["a", "b"]', contains=["DIM A$(1)", 'A$(0) = "a"'])
+check_all("element assignment", "xs = [0] * 4\nxs[2] = 9", contains=["A(2) = 9"])
+check_all(
+    "element aug-assignment", "xs = [0] * 4\nxs[1] += 5", contains=["A(1) = A(1) + 5"]
+)
+check_all("element read", "xs = [0] * 4\ny = xs[1]", contains=["= A(1)"])
+check_all("variable subscript", "xs = [0] * 4\ni = 1\ny = xs[i]", contains=["A(A)"])
+check_all("len of a list folds", "xs = [0] * 7\nn = len(xs)", contains=["= 7"])
+check_all(
+    "range(len(xs)) needs no guard",
+    "xs = [0] * 3\nfor i in range(len(xs)):\n print(xs[i])",
+    contains=["TO 2"],
+    absent=["THEN GOTO"],
+)
+check_all(
+    "string array element is a string",
+    'xs = ["a", "b"]\nt = xs[0] + "z"',
+    contains=['+ "z"'],
+)
+check_all("out-of-range index rejected", "xs = [0] * 3\nxs[5] = 1", should_fail=True)
+check_all("negative index rejected", "xs = [0] * 3\nxs[-1] = 1", should_fail=True)
+check_all("empty list rejected", "xs = []", should_fail=True)
+check_all("mixed-type list rejected", 'xs = [1, "a"]', should_fail=True)
+check_all("re-dim rejected", "xs = [0] * 3\nxs = [0] * 4", should_fail=True)
+check_all("bare array reference rejected", "xs = [0] * 3\ny = xs", should_fail=True)
+check_all("list slicing rejected", "xs = [0] * 3\ny = xs[0:2]", should_fail=True)
+
+# ── DEF FN ────────────────────────────────────────────────────────────────
+check_all(
+    "def fn",
+    "def sq(x):\n return x * x\ny = sq(4)",
+    contains=["DEF FNA(A) = A * A", "FNA(4)"],
+)
+check_all(
+    "def fn precedes use",
+    "y = 1\ndef sq(x):\n return x * x\nz = sq(y)",
+    contains=["DEF FNA"],
+)
+check_all(
+    "two def fns",
+    "def a(x):\n return x\ndef b(y):\n return y\n" "z = a(1) + b(2)",
+    contains=["FNA", "FNB"],
+)
+check_all(
+    "def fn with docstring",
+    'def sq(x):\n "doc"\n return x * x\ny=sq(2)',
+    contains=["DEF FNA"],
+)
+check_all(
+    "zero-arg def stays a subroutine",
+    "def f():\n print(1)\nf()",
+    contains=["GOSUB", "RETURN"],
+    absent=["DEF FN"],
+)
+check_all(
+    "multi-statement def with params rejected",
+    "def f(x):\n print(x)\n return x",
+    should_fail=True,
+)
+check_all("two-param def rejected", "def f(x, y):\n return x + y", should_fail=True)
+check_all(
+    "string-returning def fn rejected",
+    'def f(x):\n return "a"\ny = f(1)',
+    should_fail=True,
+)
+check_all(
+    "def fn wrong arity rejected",
+    "def sq(x):\n return x\ny = sq(1, 2)",
+    should_fail=True,
+)
+check_all(
+    "def fn called as a statement rejected",
+    "def sq(x):\n return x\nsq(1)",
+    should_fail=True,
+)
+
+# ── Hardware and DATA intrinsics ─────────────────────────────────────────
+check_all("poke", "poke(53280, 0)", contains=["POKE 53280, 0"])
+check_all("peek", "x = peek(1024)", contains=["PEEK(1024)"])
+check_all("sys_call", "sys_call(49152)", contains=["SYS 49152"])
+check_all("wait two args", "wait(1, 2)", contains=["WAIT 1, 2"])
+check_all("wait three args", "wait(1, 2, 3)", contains=["WAIT 1, 2, 3"])
+check_all("sgn", "x = sgn(-7)", contains=["SGN(-7)"])
+check_all("stop", "stop()", contains=["STOP"])
+check_all(
+    "data and restore", "data(1, 2, 3)\nrestore()", contains=["DATA 1,2,3", "RESTORE"]
+)
+check_all("data with strings", 'data("a", "b")', contains=['DATA "a","b"'])
+check_all("read into a variable", "data(1)\nx = read()", contains=["READ A"])
+check_all("getkey", 'k = ""\nk = getkey()', contains=["GET A$"])
+check_all("getkey into numeric rejected", "k = 0\nk = getkey()", should_fail=True)
+check_all("poke arity checked", "poke(1)", should_fail=True)
+check_all("data with a variable rejected", "x = 1\ndata(x)", should_fail=True)
+check_all(
+    "raw basic passthrough",
+    'basic("CIRCLE 1,160,100,50")',
+    contains=["CIRCLE 1,160,100,50"],
+)
+check_all("raw basic needs a literal", 's = "X"\nbasic(s)', should_fail=True)
+check_all(
+    "runtime import allowed",
+    "from py2basic_runtime import sgn\nx = sgn(1)",
+    contains=["SGN(1)"],
+)
+
+# ── random -> RND ────────────────────────────────────────────────────────
+check_all("random.random", "import random\nx = random.random()", contains=["RND(1)"])
+check_all(
+    "random.randint",
+    "import random\nd = random.randint(1, 6)",
+    contains=["INT(RND(1) * (6 - 1 + 1)) + 1"],
+)
+check_all(
+    "random.randrange",
+    "import random\nx = random.randrange(10)",
+    contains=["INT(RND(1) * (10))"],
+)
+check_all("random.seed", "import random\nrandom.seed(7)", contains=["RND(-ABS(7))"])
+check_all("random alias", "import random as r\nx = r.random()", contains=["RND(1)"])
+check_all(
+    "unknown random function rejected",
+    "import random\nx = random.gauss(0, 1)",
+    should_fail=True,
+)
+
+# ── sleep on dialects without SLEEP ──────────────────────────────────────
+check(
+    "sleep delay loop on B20",
+    "import time\ntime.sleep(2)",
+    dialect="B20",
+    contains=["FOR ", "TO 2000", "NEXT "],
+)
+check(
+    "sleep delay loop on B70",
+    "import time\ntime.sleep(0.5)",
+    dialect="B70",
+    contains=["TO 500"],
+)
+check(
+    "real SLEEP on B65",
+    "import time\ntime.sleep(2)",
+    dialect="B65",
+    contains=["SLEEP 2"],
+    absent=["FOR "],
+)
+
+# ── continue ─────────────────────────────────────────────────────────────
+check_all(
+    "continue in while",
+    """
+    i = 0
+    while i < 6:
+        i += 1
+        if i == 3:
+            continue
+        print(i)
+""",
+)
+check_all(
+    "continue in for",
+    """
+    for i in range(6):
+        if i == 2:
+            continue
+        print(i)
+""",
+)
+check_all(
+    "continue and break together",
+    """
+    for i in range(6):
+        if i == 2:
+            continue
+        if i == 4:
+            break
+        print(i)
+    print("done")
+""",
+)
+check_all("continue outside loop rejected", "continue", should_fail=True)
+
+# ── Chained comparisons ──────────────────────────────────────────────────
+check_all(
+    "chained comparison",
+    "x = 5\nif 1 < x < 10:\n print('mid')",
+    contains=["(1 < A) AND (A < 10)"],
+)
+check_all("triple chain", "x = 5\nif 0 <= x <= 9 <= 20:\n print('y')", contains=["AND"])
+check_all(
+    "simple comparison unchanged",
+    "x = 5\nif x > 1:\n print('y')",
+    contains=["A > 1"],
+    absent=["AND"],
+)
+
+# ── INSTR (BASIC 65 / 7.0 only) ──────────────────────────────────────────
+for d in ("B65", "B70"):
+    check(
+        "find to INSTR",
+        's = "hello"\nn = s.find("l")',
+        dialect=d,
+        contains=['INSTR(A$, "l") - 1'],
+    )
+    check(
+        "in to INSTR",
+        's = "hello"\nif "ell" in s:\n print("y")',
+        dialect=d,
+        contains=['INSTR(A$, "ell") > 0'],
+    )
+    check(
+        "not in to INSTR",
+        's = "hi"\nif "z" not in s:\n print("y")',
+        dialect=d,
+        contains=['INSTR(A$, "z") = 0'],
+    )
+    check("hex to HEX$", "x = hex(255)", dialect=d, contains=["HEX$(255)"])
+    check(
+        "int base 16 to DEC",
+        'n = "FF"\nx = int(n, 16)',
+        dialect=d,
+        contains=["DEC(A$)"],
+    )
+check(
+    "find rejected on B20",
+    's = "hello"\nn = s.find("l")',
+    dialect="B20",
+    should_fail=True,
+)
+check(
+    "in rejected on B20",
+    's = "hi"\nif "h" in s:\n print(1)',
+    dialect="B20",
+    should_fail=True,
+)
+check("hex rejected on B20", "x = hex(255)", dialect="B20", should_fail=True)
+check_all("int with base 8 rejected", 'n = "77"\nx = int(n, 8)', should_fail=True)
 
 print(f"\n{'=' * 50}")
 print(f"Results: {PASS} passed, {FAIL} failed")

@@ -290,6 +290,172 @@ check_round_trip(
 """,
 )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Keyword coverage
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── String functions ──────────────────────────────────────────────────────
+check("LEFT$", "10 A$ = LEFT$(B$, 3)", contains=["[:3]"])
+check("RIGHT$", "10 A$ = RIGHT$(B$, 3)", contains=["[-(3):]"])
+check("MID$ with length", "10 A$ = MID$(B$, 2, 3)", contains=["(2) - 1"])
+check("MID$ without length", "10 A$ = MID$(B$, 2)", contains=["(2) - 1:]"])
+check("VAL", "10 A = VAL(B$)", contains=["float(b_str)"])
+check(
+    "nested string functions", "10 A = VAL(LEFT$(B$, 2))", contains=["float(", "[:2]"]
+)
+
+# ── Numeric intrinsics get runtime shims ─────────────────────────────────
+check("RND", "10 A = RND(1)", contains=["_rnd(1)", "def _rnd", "import random"])
+check("SGN", "10 A = SGN(B)", contains=["_sgn(b)", "def _sgn"])
+check("PEEK", "10 A = PEEK(1024)", contains=["_peek(1024)", "def _peek"])
+check("shims only when used", "10 A = 1", absent=["def _rnd", "def _sgn"])
+
+# ── Hardware statements become TODOs, not silent no-ops ─────────────────
+check("POKE", "10 POKE 53280, 0", contains=["# TODO", "POKE"])
+check("SYS", "10 SYS 49152", contains=["# TODO", "SYS"])
+check("WAIT", "10 WAIT 1, 2", contains=["# TODO", "WAIT"])
+check("STOP", "10 STOP", contains=["sys.exit()", "import sys"])
+
+# ── Arrays ───────────────────────────────────────────────────────────────
+check("DIM numeric", "10 DIM A(10)", contains=["a_arr = [0] * 11"])
+check("DIM string", "10 DIM A$(4)", contains=['a_str_arr = [""] * 5'])
+check(
+    "DIM several", "10 DIM A(2), B(3)", contains=["a_arr = [0] * 3", "b_arr = [0] * 4"]
+)
+check("array assignment", "10 DIM A(5)\n20 A(2) = 7", contains=["a_arr[2] = 7"])
+check("array read", "10 DIM A(5)\n20 B = A(2)", contains=["b = a_arr[2]"])
+# A and A(0) are different variables in BASIC; they must not fuse.
+check(
+    "array and scalar of the same letter stay separate",
+    "10 DIM A(5)\n20 A = 1\n30 A(2) = 7",
+    contains=["a = 1", "a_arr[2] = 7"],
+)
+
+# ── DATA / READ / RESTORE ────────────────────────────────────────────────
+check(
+    "DATA and READ",
+    "10 DATA 1, 2, 3\n20 READ V",
+    contains=["_DATA = [1, 2, 3]", "v = _read()", "def _read"],
+)
+check("DATA with words", "10 DATA ONE, TWO\n20 READ V$", contains=['"ONE"', '"TWO"'])
+check(
+    "READ several",
+    "10 DATA 1, 2\n20 READ A, B",
+    contains=["a = _read()", "b = _read()"],
+)
+check(
+    "RESTORE",
+    "10 DATA 1\n20 READ A\n30 RESTORE",
+    contains=["_restore()", "def _restore"],
+)
+
+# ── GET / GETKEY / DEF FN ────────────────────────────────────────────────
+check("GET", "10 GET K$", contains=["# TODO: GET"])
+check("GETKEY", "10 GETKEY K$", contains=["input()[:1]"])
+check(
+    "DEF FN",
+    "10 DEF FNA(X) = X * X\n20 B = FNA(3)",
+    contains=["def fna(x):", "return x * x"],
+)
+
+# ── ON x GOTO / GOSUB ────────────────────────────────────────────────────
+check(
+    "ON GOTO",
+    "10 ON X GOTO 100, 110\n100 PRINT 1\n110 PRINT 2",
+    contains=["if x == 1:", "elif x == 2:", "# TODO"],
+)
+check(
+    "ON GOSUB",
+    "10 ON X GOSUB 100\n20 END\n100 PRINT 1\n110 RETURN",
+    contains=["if x == 1:", "sub_100()"],
+)
+
+# ── Single-line ELSE ─────────────────────────────────────────────────────
+check(
+    "single-line ELSE",
+    '10 IF X = 1 THEN PRINT "A" : ELSE PRINT "B"',
+    contains=['print("A")', "else:", 'print("B")'],
+)
+check(
+    "single-line ELSE with several statements",
+    "10 IF X = 1 THEN A = 1 : B = 2 : ELSE A = 3",
+    contains=["a = 1", "b = 2", "else:", "a = 3"],
+)
+
+# ── Unknown calls are reported rather than passed through ───────────────
+check(
+    "unknown function flagged",
+    "10 A = SPRCOLOR(1)",
+    contains=["# TODO: unconverted BASIC calls", "SPRCOLOR"],
+)
+check(
+    "known functions are not flagged",
+    "10 A = INT(B)",
+    absent=["unconverted BASIC calls"],
+)
+
+# ── Blocks containing only TODOs still parse ────────────────────────────
+check(
+    "if body of only TODOs gets pass", "10 IF X = 1 THEN SYS 49152", contains=["pass"]
+)
+
+# ── Round trips for the new keywords ────────────────────────────────────
+check_round_trip(
+    "string slicing",
+    """
+    s = "hello world"
+    print(s[:5])
+    print(s[-5:])
+    print(s[6:11])
+    print(s[1])
+""",
+)
+
+check_round_trip(
+    "arrays",
+    """
+    xs = [0] * 5
+    for i in range(5):
+        xs[i] = i * 2
+    total = 0
+    for i in range(5):
+        total += xs[i]
+    print(total)
+""",
+)
+
+check_round_trip(
+    "continue and break",
+    """
+    for i in range(6):
+        if i == 2:
+            continue
+        if i == 4:
+            break
+        print(i)
+    print("done")
+""",
+)
+
+check_round_trip(
+    "chained comparison",
+    """
+    for i in range(6):
+        if 1 < i < 4:
+            print(i)
+""",
+)
+
+check_round_trip(
+    "val",
+    """
+    n = "42"
+    x = int(n)
+    print(x + 1)
+""",
+)
+
 print(f"\n{'=' * 50}")
 print(f"Results: {PASS} passed, {FAIL} failed")
 if FAIL:

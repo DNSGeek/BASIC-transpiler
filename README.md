@@ -150,7 +150,14 @@ bare `FOR I = 0 TO -1` would run its body once where Python's `range(0)` runs
 it zero times.
 
 ```python
-break   # EXIT in a while loop; GOTO past NEXT in a for loop
+break      # EXIT in a while loop; GOTO past NEXT in a for loop
+continue   # jumps to the loop's test (while) or its NEXT (for)
+```
+
+Chained comparisons work, and expand to an `AND`:
+
+```python
+if 1 < x < 10:    # IF (1 < A) AND (A < 10)
 ```
 
 ### Functions (subroutines)
@@ -185,14 +192,135 @@ log(x, b)   # (LOG(X) / LOG(B))
 
 Argument counts are checked, so `int()` is a clear error rather than a crash.
 
+`int()` and `float()` of a **string** become `VAL()`, since `INT("42")` is a
+`?TYPE MISMATCH ERROR` on real hardware.
+
 `s.upper()` and `s.lower()` map to `UPPER$()` / `LOWER$()`, which exist only
 in BASIC 65 — the other dialects reject them.
+
+### String slicing
+
+```python
+s = "hello world"
+s[:5]      # LEFT$(S$, 5)
+s[-5:]     # RIGHT$(S$, 5)
+s[6:11]    # MID$(S$, 7, 5)
+s[2:]      # MID$(S$, 3)
+s[1]       # MID$(S$, 2, 1)
+s[-1]      # MID$(S$, LEN(S$), 1)
+s[:-1]     # LEFT$(S$, LEN(S$) - 1)
+```
+
+Slice steps (`s[::2]`) are not supported. A negative bound works only in the
+`s[-n:]` and `s[:-n]` forms.
+
+### Lists become arrays
+
+```python
+xs = [0] * 10   # DIM A(9)   — DIM allocates 0..n, so a 10-element list is A(9)
+xs = [1, 2, 3]  # DIM A(2) : A(0) = 1 : A(1) = 2 : A(2) = 3
+names = ["", ""]  # DIM A$(1)
+
+xs[3] = 7       # A(3) = 7
+xs[3] += 1      # A(3) = A(3) + 1
+y = xs[i]       # A(A)
+len(xs)         # folded to a literal at transpile time
+```
+
+Arrays have a fixed size and cannot be re-assigned, sliced, or passed around
+as a whole. Constant indices are range-checked at transpile time.
+
+Note that in Commodore BASIC `A` and `A(0)` are _different_ variables, so an
+array may share a letter with a scalar. That is legal and intentional.
+
+### Functions with a parameter — DEF FN
+
+A one-argument function whose body is a single `return` of a numeric
+expression becomes a BASIC `DEF FN`:
+
+```python
+def square(x):      # DEF FNA(A) = A * A
+    return x * x
+
+y = square(4)       # B = FNA(4)
+```
+
+Anything else — more parameters, a string result, or more than one
+statement — still has to be a zero-argument `GOSUB` subroutine using global
+variables.
+
+### BASIC intrinsics
+
+These have no Python equivalent, so they are exposed as plain functions:
+
+```python
+poke(53280, 0)      # POKE 53280, 0
+x = peek(1024)      # PEEK(1024)
+sys_call(49152)     # SYS 49152
+wait(1, 2)          # WAIT 1, 2
+x = sgn(-7)         # SGN(-7)
+k = ""
+k = getkey()        # GET A$
+stop()              # STOP
+
+data(1, 2, 3)       # DATA 1,2,3
+v = read()          # READ A
+restore()           # RESTORE
+
+x = pos(0)          # POS(0)
+x = fre(0)          # FRE(0)
+print(tab(10))      # TAB(10)
+```
+
+To run and test the program under CPython before transpiling, import them
+from the bundled runtime:
+
+```python
+from py2basic_runtime import peek, poke, sgn
+```
+
+`py2basic_runtime` backs POKE/PEEK with a dictionary and stubs the rest, so
+the control flow of your program is testable locally.
+
+### Anything else — raw BASIC
+
+For dialect commands this transpiler does not model (graphics, sound, disk),
+`basic()` passes a literal statement straight through:
+
+```python
+basic("CIRCLE 1,160,100,50")   # CIRCLE 1,160,100,50
+basic("SOUND 1,4096,60")       # SOUND 1,4096,60
+```
+
+Nothing is validated — you are writing BASIC at that point.
+
+### Random numbers
+
+```python
+import random
+random.seed(7)              # A = RND(-ABS(7))
+random.random()             # RND(1)
+random.randint(1, 6)        # INT(RND(1) * (6 - 1 + 1)) + 1
+random.randrange(10)        # INT(RND(1) * (10))
+```
+
+### Substring search (BASIC 65 / 7.0)
+
+```python
+s.find("l")     # INSTR(S$, "l") - 1     — same 0-based / -1 convention
+"ell" in s      # INSTR(S$, "ell") > 0
+"z" not in s    # INSTR(S$, "z") = 0
+hex(255)        # HEX$(255)              — note: no 0x prefix, fixed width
+int("FF", 16)   # DEC("FF")
+```
+
+BASIC 2.0 has none of these and rejects them with a clear message.
 
 ### Standard library (limited)
 
 ```python
 import time
-time.sleep(1.5)   # SLEEP 1.5   (BASIC 65 only)
+time.sleep(1.5)   # SLEEP 1.5 on BASIC 65; a FOR/NEXT delay loop elsewhere
 
 import sys
 sys.exit()        # END
@@ -274,7 +402,7 @@ Commodore's limit of 63999.
 The transpiler will give you a clear error message for any of these:
 
 - Function parameters or return values
-- Lists, tuples, dicts, sets
+- Tuples, dicts, sets (lists are supported — see Arrays)
 - Classes
 - Lambda expressions
 - List/dict/set comprehensions
@@ -289,6 +417,9 @@ The transpiler will give you a clear error message for any of these:
 - Nested or conditional function definitions
 - A `range()` step that is not a literal number
 - Reusing one variable for both strings and numbers
+- Slice steps, list slicing, and negative list indices
+- Resizing a list, or using one as a value
+- `min()` / `max()` — no BASIC equivalent
 
 f-strings and `%` formatting **are** supported, minus format specs:
 
