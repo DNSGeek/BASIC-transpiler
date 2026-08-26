@@ -159,4 +159,4 @@ runs correctly.
 
 ## License
 
-MIT
+GPL v2
