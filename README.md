@@ -474,13 +474,6 @@ Output (BASIC 2.0, the default dialect):
 180 END
 ```
 
-## Transferring to MEGA65
-
-1. Save the output as a `.bas` file
-2. Copy it to your MEGA65's SD card (or a D81 image)
-3. On the MEGA65: `IMPORT "FIZZBUZZ.BAS"`
-4. `LIST` to verify, `RUN` to execute
-
 ## License
 
 GPL v2
