@@ -32,59 +32,59 @@ through all three dialects, comparing program _output_ rather than source.
 
 ## What it handles
 
-| BASIC construct               | Python output                                    |
-| ----------------------------- | ------------------------------------------------ |
-| `FOR I = 1 TO 10` / `NEXT I`  | `for i in range(1, 11):`                         |
-| `DO WHILE cond` / `LOOP`      | `while cond:`                                    |
-| `DO UNTIL cond` / `LOOP`      | `while not cond:`                                |
-| `DO` / `LOOP WHILE cond`      | `while True:` + trailing `break` (bottom-tested) |
-| `EXIT`                        | `break`                                          |
-| `IF NOT (cond) THEN GOTO n`   | `if cond:` / `if/else`                           |
-| `IF cond THEN GOTO n`         | `if not cond:`, or `break` / `continue`          |
-| `IF (c) THEN GOTO` + PRINT + END | `assert c, "message"`                         |
-| `GOTO` back to an earlier line | `while cond:` / `while True:`                   |
-| `IF cond THEN BEGIN` / `BEND` | `if cond:` / `if/else`                           |
-| `BEND : ELSE BEGIN`           | `else:`                                          |
-| `GOSUB n` / `RETURN`          | `def func():` / `func()`                         |
-| `PRINT a ; b`                 | `print(a, b)`                                    |
-| `INPUT a_str`                 | `a_str = input()`                                |
-| `INPUT a` (numeric)           | `a = float(input())`                             |
-| `INPUT "p"; a, b`             | one `input()` per variable                       |
-| `REM text`                    | `# text`                                         |
-| `END`                         | `sys.exit()`                                     |
-| `SLEEP n`                     | `time.sleep(n)`                                  |
-| `MOD(a, b)`                   | `a % b`                                          |
-| `STR$(x)`                     | `str(x)`                                         |
-| `CHR$(x)`                     | `chr(x)`                                         |
-| `ASC(x)`                      | `ord(x)`                                         |
-| `LEN(x)`                      | `len(x)`                                         |
-| `INT(x)`                      | `int(x)`                                         |
-| `ABS(x)`                      | `abs(x)`                                         |
-| `SQR(x)`                      | `math.sqrt(x)`                                   |
-| `SIN/COS/TAN/ATN/LOG/EXP`     | `math.sin()` etc                                 |
-| `x ^ y`                       | `x ** y`                                         |
-| `x <> y`                      | `x != y`                                         |
-| `CHR$(34)` concatenation      | Restored to an escaped `\"` in the string        |
-| `CHR$(13)` concatenation      | Restored to a `\n` in the string                 |
-| `RETURN` before the end       | `return`                                         |
-| `A = 1 : B = 2`               | Split into separate statements                   |
-| `NEXT` with no variable       | Closes the innermost `FOR`                       |
-| `LEFT$(s,n)` / `RIGHT$(s,n)`  | `s[:n]` / `s[-n:]`                               |
-| `MID$(s,a,b)`                 | `s[a-1:a-1+b]`                                   |
-| `VAL(s)`                      | `float(s)`                                       |
-| `INSTR(a,b)`                  | `a.find(b) + 1`                                  |
-| `HEX$(x)` / `DEC(s)`          | `hex(x)` / `int(s, 16)`                          |
-| `RND`, `SGN`, `PEEK`, `FRE`   | runtime shims — see below                        |
-| `POS`, `TAB`, `SPC`           | runtime shims — see below                        |
-| `DIM a(n)`                    | `a_arr = [0] * (n + 1)`                          |
-| `a(i) = v`                    | `a_arr[i] = v`                                   |
-| `DATA` / `READ` / `RESTORE`   | `_DATA` list plus `_read()` / `_restore()`       |
-| `DEF FNa(x) = expr`           | `def fna(x): return expr`                        |
-| `ON x GOTO` / `ON x GOSUB`    | `if`/`elif` ladder                               |
-| `IF c THEN a : ELSE b`        | `if c: a` / `else: b`                            |
-| `GETKEY v$`                   | `v_str = input()[:1]`                            |
-| `STOP`                        | `sys.exit()`                                     |
-| `POKE` / `SYS` / `WAIT`       | `# TODO` markers                                 |
+| BASIC construct                  | Python output                                    |
+| -------------------------------- | ------------------------------------------------ |
+| `FOR I = 1 TO 10` / `NEXT I`     | `for i in range(1, 11):`                         |
+| `DO WHILE cond` / `LOOP`         | `while cond:`                                    |
+| `DO UNTIL cond` / `LOOP`         | `while not cond:`                                |
+| `DO` / `LOOP WHILE cond`         | `while True:` + trailing `break` (bottom-tested) |
+| `EXIT`                           | `break`                                          |
+| `IF NOT (cond) THEN GOTO n`      | `if cond:` / `if/else`                           |
+| `IF cond THEN GOTO n`            | `if not cond:`, or `break` / `continue`          |
+| `IF (c) THEN GOTO` + PRINT + END | `assert c, "message"`                            |
+| `GOTO` back to an earlier line   | `while cond:` / `while True:`                    |
+| `IF cond THEN BEGIN` / `BEND`    | `if cond:` / `if/else`                           |
+| `BEND : ELSE BEGIN`              | `else:`                                          |
+| `GOSUB n` / `RETURN`             | `def func():` / `func()`                         |
+| `PRINT a ; b`                    | `print(a, b)`                                    |
+| `INPUT a_str`                    | `a_str = input()`                                |
+| `INPUT a` (numeric)              | `a = float(input())`                             |
+| `INPUT "p"; a, b`                | one `input()` per variable                       |
+| `REM text`                       | `# text`                                         |
+| `END`                            | `sys.exit()`                                     |
+| `SLEEP n`                        | `time.sleep(n)`                                  |
+| `MOD(a, b)`                      | `a % b`                                          |
+| `STR$(x)`                        | `str(x)`                                         |
+| `CHR$(x)`                        | `chr(x)`                                         |
+| `ASC(x)`                         | `ord(x)`                                         |
+| `LEN(x)`                         | `len(x)`                                         |
+| `INT(x)`                         | `int(x)`                                         |
+| `ABS(x)`                         | `abs(x)`                                         |
+| `SQR(x)`                         | `math.sqrt(x)`                                   |
+| `SIN/COS/TAN/ATN/LOG/EXP`        | `math.sin()` etc                                 |
+| `x ^ y`                          | `x ** y`                                         |
+| `x <> y`                         | `x != y`                                         |
+| `CHR$(34)` concatenation         | Restored to an escaped `\"` in the string        |
+| `CHR$(13)` concatenation         | Restored to a `\n` in the string                 |
+| `RETURN` before the end          | `return`                                         |
+| `A = 1 : B = 2`                  | Split into separate statements                   |
+| `NEXT` with no variable          | Closes the innermost `FOR`                       |
+| `LEFT$(s,n)` / `RIGHT$(s,n)`     | `s[:n]` / `s[-n:]`                               |
+| `MID$(s,a,b)`                    | `s[a-1:a-1+b]`                                   |
+| `VAL(s)`                         | `float(s)`                                       |
+| `INSTR(a,b)`                     | `a.find(b) + 1`                                  |
+| `HEX$(x)` / `DEC(s)`             | `hex(x)` / `int(s, 16)`                          |
+| `RND`, `SGN`, `PEEK`, `FRE`      | runtime shims — see below                        |
+| `POS`, `TAB`, `SPC`              | runtime shims — see below                        |
+| `DIM a(n)`                       | `a_arr = [0] * (n + 1)`                          |
+| `a(i) = v`                       | `a_arr[i] = v`                                   |
+| `DATA` / `READ` / `RESTORE`      | `_DATA` list plus `_read()` / `_restore()`       |
+| `DEF FNa(x) = expr`              | `def fna(x): return expr`                        |
+| `ON x GOTO` / `ON x GOSUB`       | `if`/`elif` ladder                               |
+| `IF c THEN a : ELSE b`           | `if c: a` / `else: b`                            |
+| `GETKEY v$`                      | `v_str = input()[:1]`                            |
+| `STOP`                           | `sys.exit()`                                     |
+| `POKE` / `SYS` / `WAIT`          | `# TODO` markers                                 |
 
 Variable names are expanded:
 

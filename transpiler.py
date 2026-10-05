@@ -960,6 +960,13 @@ class Transpiler(ast.NodeVisitor):
             parts.append('"' + "".join(run) + '"')
         return " + ".join(parts) if parts else '""'
 
+    def _require(self, flag, lineno, what):
+        if not getattr(self.dialect, flag):
+            raise TranspilerError(
+                f"{what} is not available in {self.dialect.dialect_name()}.",
+                lineno,
+            )
+
     # ── Expression compiler ────────────────────────────────────────────────────
 
     def _expr(self, node):
@@ -1262,13 +1269,6 @@ class Transpiler(ast.NodeVisitor):
         self.emitter.emit(ln, "GOTO 0")  # placeholder, backfilled by the loop
         self._break_frames[-1]["lines"].append(ln)
 
-    def _require(self, flag, lineno, what):
-        if not getattr(self.dialect, flag):
-            raise TranspilerError(
-                f"{what} is not available in {self.dialect.dialect_name()}.",
-                lineno,
-            )
-
     def _compare_expr(self, node):
         """
         Compile a comparison, including the chained form.
@@ -1516,6 +1516,21 @@ class Transpiler(ast.NodeVisitor):
 
         return self.BUILTINS[name][2].format(*args)
 
+    def _module_expr(self, module, attr, node, lineno):
+        """A call on one of the supported modules, in expression position."""
+        if module == "random":
+            return self._random_expr(attr, node, lineno)
+        if module in ("math", "py2basic_runtime") and attr in self.BUILTINS:
+            # math.sqrt(x) and friends share the table with the bare names.
+            return self._builtin_expr(attr, node, lineno)
+        if module == "math":
+            raise TranspilerError(f"math.{attr}() has no BASIC equivalent.", lineno)
+        raise TranspilerError(
+            f"{module}.{attr}() has no value here; "
+            f"use it as a statement on its own line.",
+            lineno,
+        )
+
     def _call_expr(self, node):
         lineno = getattr(node, "lineno", 0)
 
@@ -1577,20 +1592,60 @@ class Transpiler(ast.NodeVisitor):
 
         raise TranspilerError(f"Unsupported call: {ast.dump(node)}", lineno)
 
-    def _module_expr(self, module, attr, node, lineno):
-        """A call on one of the supported modules, in expression position."""
-        if module == "random":
-            return self._random_expr(attr, node, lineno)
-        if module in ("math", "py2basic_runtime") and attr in self.BUILTINS:
-            # math.sqrt(x) and friends share the table with the bare names.
-            return self._builtin_expr(attr, node, lineno)
-        if module == "math":
-            raise TranspilerError(f"math.{attr}() has no BASIC equivalent.", lineno)
-        raise TranspilerError(
-            f"{module}.{attr}() has no value here; "
-            f"use it as a statement on its own line.",
-            lineno,
-        )
+    def _emit_intrinsic(self, name, node, lineno):
+        low, high, template = self.STATEMENT_INTRINSICS[name]
+        if node.keywords:
+            raise TranspilerError(
+                f"'{name}()' does not accept keyword arguments.", lineno
+            )
+        count = len(node.args)
+        if count < low or (high is not None and count > high):
+            want = (
+                str(low)
+                if low == high
+                else f"{low}+" if high is None else f"{low}-{high}"
+            )
+            raise TranspilerError(
+                f"'{name}()' takes {want} argument(s), got {count}.", lineno
+            )
+
+        if name == "basic":
+            # Raw BASIC passthrough, for dialect commands this transpiler
+            # does not model (graphics, sound, disk).
+            arg = node.args[0]
+            if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+                raise TranspilerError("basic() takes a literal string.", lineno)
+            text = arg.value.strip()
+            if not text:
+                raise TranspilerError("basic() needs a statement.", lineno)
+            self._emit(text)
+            return
+
+        if name == "data":
+            items = []
+            for a in node.args:
+                if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                    if '"' in a.value or "," in a.value or ":" in a.value:
+                        raise TranspilerError(
+                            'data() strings cannot contain " , or :', lineno
+                        )
+                    items.append(f'"{a.value}"')
+                else:
+                    value = self._static_num(a)
+                    if value is None:
+                        raise TranspilerError(
+                            "data() takes literal numbers and strings only.",
+                            lineno,
+                        )
+                    items.append(str(value))
+            self._emit("DATA " + ",".join(items))
+            return
+
+        args = [self._expr(a) for a in node.args]
+        if name == "wait":
+            self._emit("WAIT " + ", ".join(args))
+            return
+        self._emit(template.format(*args))
 
     def _module_stmt(self, module, attr, node, lineno):
         """A call on one of the supported modules, in statement position."""
@@ -1834,61 +1889,6 @@ class Transpiler(ast.NodeVisitor):
             stmt += ";"
         self._emit(stmt)
 
-    def _emit_intrinsic(self, name, node, lineno):
-        low, high, template = self.STATEMENT_INTRINSICS[name]
-        if node.keywords:
-            raise TranspilerError(
-                f"'{name}()' does not accept keyword arguments.", lineno
-            )
-        count = len(node.args)
-        if count < low or (high is not None and count > high):
-            want = (
-                str(low)
-                if low == high
-                else f"{low}+" if high is None else f"{low}-{high}"
-            )
-            raise TranspilerError(
-                f"'{name}()' takes {want} argument(s), got {count}.", lineno
-            )
-
-        if name == "basic":
-            # Raw BASIC passthrough, for dialect commands this transpiler
-            # does not model (graphics, sound, disk).
-            arg = node.args[0]
-            if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
-                raise TranspilerError("basic() takes a literal string.", lineno)
-            text = arg.value.strip()
-            if not text:
-                raise TranspilerError("basic() needs a statement.", lineno)
-            self._emit(text)
-            return
-
-        if name == "data":
-            items = []
-            for a in node.args:
-                if isinstance(a, ast.Constant) and isinstance(a.value, str):
-                    if '"' in a.value or "," in a.value or ":" in a.value:
-                        raise TranspilerError(
-                            'data() strings cannot contain " , or :', lineno
-                        )
-                    items.append(f'"{a.value}"')
-                else:
-                    value = self._static_num(a)
-                    if value is None:
-                        raise TranspilerError(
-                            "data() takes literal numbers and strings only.",
-                            lineno,
-                        )
-                    items.append(str(value))
-            self._emit("DATA " + ",".join(items))
-            return
-
-        args = [self._expr(a) for a in node.args]
-        if name == "wait":
-            self._emit("WAIT " + ", ".join(args))
-            return
-        self._emit(template.format(*args))
-
     def _compile_call_stmt(self, node):
         lineno = getattr(node, "lineno", 0)
 
@@ -1996,29 +1996,6 @@ class Transpiler(ast.NodeVisitor):
             raise TranspilerError("input() takes at most one prompt.", lineno)
         return True, (call.args[0] if call.args else None)
 
-    def visit_Assign(self, node):
-        lineno = node.lineno
-        value = node.value
-        if len(node.targets) > 1:
-            # a = b = 0: BASIC has no chained assignment, so the value is
-            # evaluated once per target. That is only safe for pure values.
-            if not all(isinstance(t, ast.Name) for t in node.targets):
-                raise TranspilerError(
-                    "Chained assignment works for plain variables only.", lineno
-                )
-            if (
-                self._list_literal(value, lineno) is not None
-                or self._input_call(value, lineno)[0]
-                or self._is_call_to(value, ("getkey", "read"))
-            ):
-                raise TranspilerError(
-                    "Chained assignment cannot take a list, input(), getkey() "
-                    "or read(); assign them one at a time.",
-                    lineno,
-                )
-        for target in node.targets:
-            self._assign_one(target, value, lineno)
-
     def _assign_one(self, target, value, lineno):
         # xs[i] = v  ->  A(I) = v
         if isinstance(target, ast.Subscript):
@@ -2064,6 +2041,29 @@ class Transpiler(ast.NodeVisitor):
 
         basic_var = self._basic_var(py_name)
         self._emit(f"{basic_var} = {self._expr(value)}")
+
+    def visit_Assign(self, node):
+        lineno = node.lineno
+        value = node.value
+        if len(node.targets) > 1:
+            # a = b = 0: BASIC has no chained assignment, so the value is
+            # evaluated once per target. That is only safe for pure values.
+            if not all(isinstance(t, ast.Name) for t in node.targets):
+                raise TranspilerError(
+                    "Chained assignment works for plain variables only.", lineno
+                )
+            if (
+                self._list_literal(value, lineno) is not None
+                or self._input_call(value, lineno)[0]
+                or self._is_call_to(value, ("getkey", "read"))
+            ):
+                raise TranspilerError(
+                    "Chained assignment cannot take a list, input(), getkey() "
+                    "or read(); assign them one at a time.",
+                    lineno,
+                )
+        for target in node.targets:
+            self._assign_one(target, value, lineno)
 
     def visit_AugAssign(self, node):
         lineno = node.lineno

@@ -1520,6 +1520,31 @@ class Transpiler:
 
         return i
 
+    def _try_emit_assert(self, lines, i, target, cond):
+        """
+        py2basic's assert:
+
+            IF (cond) THEN GOTO n
+            PRINT "message"
+            END
+            [n]
+
+        Returns the index after the END, or None if that is not the shape.
+        """
+        if i + 1 >= len(lines) or lines[i + 1].number >= target:
+            return None
+        if i + 2 < len(lines) and lines[i + 2].number < target:
+            return None
+        print_m = re.match(r"^PRINT\s+(.+)$", lines[i].text)
+        if not print_m or not re.match(r"^END\s*$", lines[i + 1].text):
+            return None
+        message = self.ec.convert(print_m.group(1))
+        if message == '"ASSERTION FAILED"':
+            self._emit(f"assert {cond}")
+        else:
+            self._emit(f"assert {cond}, {message}")
+        return i + 2
+
     def _emit_b20_if(self, lines, i, cond_src, target, cfg, skip_when_true=False):
         """
         Recover an IF that jumps past its body.
@@ -1598,31 +1623,6 @@ class Transpiler:
                 self._close_block(mark)
 
         return i
-
-    def _try_emit_assert(self, lines, i, target, cond):
-        """
-        py2basic's assert:
-
-            IF (cond) THEN GOTO n
-            PRINT "message"
-            END
-            [n]
-
-        Returns the index after the END, or None if that is not the shape.
-        """
-        if i + 1 >= len(lines) or lines[i + 1].number >= target:
-            return None
-        if i + 2 < len(lines) and lines[i + 2].number < target:
-            return None
-        print_m = re.match(r"^PRINT\s+(.+)$", lines[i].text)
-        if not print_m or not re.match(r"^END\s*$", lines[i + 1].text):
-            return None
-        message = self.ec.convert(print_m.group(1))
-        if message == '"ASSERTION FAILED"':
-            self._emit(f"assert {cond}")
-        else:
-            self._emit(f"assert {cond}, {message}")
-        return i + 2
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
