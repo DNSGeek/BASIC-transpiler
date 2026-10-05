@@ -24,9 +24,16 @@ select = [
     "RUF",  # ruff-specific
 ]
 
+# isort runs as a formatter in CI and ruff's "I" rule re-checks its output,
+# so the two must agree. By default isort puts `import X as Y` on its own
+# line while ruff merges it, which fails CI with I001 — combine in both.
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
 [tool.isort]
 profile = "black"
 line_length = 88
+combine_as_imports = true
 
 [tool.black]
 line-length = 88

@@ -14,8 +14,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from basic2py import Transpiler as BasicToPy
-from transpiler import Basic2Dialect, Basic7Dialect, Basic65Dialect, TranspilerError
-from transpiler import Transpiler as PyToBasic
+from transpiler import (
+    Basic2Dialect,
+    Basic7Dialect,
+    Basic65Dialect,
+    Transpiler as PyToBasic,
+    TranspilerError,
+)
 
 PASS = 0
 FAIL = 0
