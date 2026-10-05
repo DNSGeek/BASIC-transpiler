@@ -20,21 +20,25 @@ Supported Python subset:
   - while loops                 -> dialect-specific
   - if/elif/else                -> dialect-specific
   - def (no params, no return)  -> GOSUB/RETURN subroutines
+  - def f(x): return <expr>     -> DEF FN
   - Basic math (+,-,*,/,%,**)   -> BASIC ops
-  - time.sleep() / sys.exit()   -> SLEEP (B65 only) / END
+  - lists of fixed size         -> DIM arrays
+  - string slicing              -> LEFT$ / RIGHT$ / MID$
+  - break / continue            -> EXIT or GOTO
+  - time.sleep() / sys.exit()   -> SLEEP (B65, whole seconds on B7.0) / END
   - assert                      -> IF NOT / PRINT / END
 
 NOT supported:
-  - Function parameters or return values
-  - Lists, dicts, sets, tuples
+  - Function parameters or return values (beyond DEF FN)
+  - dicts, sets, tuples
   - Classes, lambda, comprehensions
-  - import (except time, sys, math)
+  - import (except time, sys, math, random, py2basic_runtime)
   - try/except, with, raise
-  - Multiple assignment targets
-  - continue
+  - Tuple unpacking (a, b = 1, 2)
 """
 
 import ast
+import math
 import re
 import sys
 import textwrap
@@ -224,6 +228,28 @@ def _fake_mod(left: str, right: str) -> str:
     return f"{a} - INT({a} / {b}) * {b}"
 
 
+# Precedence of the BASIC text _expr() produces, highest first. BASIC and
+# Python agree on the order, but BASIC's ^ is left-associative where
+# Python's ** is right-associative, and BASIC's NOT/AND/OR are bitwise.
+_PREC_ATOM = 10
+_PREC_POW = 7
+_PREC_NEG = 6
+_PREC_MUL = 5
+_PREC_ADD = 4
+_PREC_CMP = 3
+_PREC_NOT = 2
+_PREC_AND = 1
+_PREC_OR = 0
+
+_BINOP_PREC = {
+    ast.Pow: _PREC_POW,
+    ast.Mult: _PREC_MUL,
+    ast.Div: _PREC_MUL,
+    ast.Add: _PREC_ADD,
+    ast.Sub: _PREC_ADD,
+}
+
+
 class DialectEmitter(ABC):
     #: Dialect provides UPPER$() / LOWER$() string-case functions.
     has_string_case = False
@@ -231,6 +257,12 @@ class DialectEmitter(ABC):
     has_instr = False
     #: Dialect provides HEX$() and DEC().
     has_hex = False
+    #: Dialect provides a MOD() function (otherwise it is faked with INT()).
+    has_mod = False
+    #: Dialect provides the XOR(a, b) function.
+    has_xor = False
+    #: Longest program line the machine's screen editor accepts.
+    max_line_length = 80
     #: Empty FOR/NEXT iterations per second, used to fake time.sleep().
     #: Rough — real timing depends on machine, ROM and video standard.
     delay_loop_rate = 1000
@@ -267,19 +299,34 @@ class Basic2Dialect(DialectEmitter):
         orelse        ...orelse...
                       REM (end)
 
-    while cond:       REM (top)
-        body          IF NOT (cond) THEN GOTO end
-                      ...body...
+    while cond:       IF NOT (cond) THEN GOTO end     (top)
+        body          ...body...
                       GOTO top
-                      REM (end)
+                      (end)
+
+    while True:       ...body...                      (top)
+        body          GOTO top
+                      (end)
 
     Modulo:           A - INT(A/B)*B
-    sleep():          not available
+    sleep():          FOR/NEXT delay loop
     """
+
+    def _skip_test(self, node):
+        """
+        The condition under which a construct guarded by node is skipped.
+
+        `IF NOT (cond)` in general; `if not x:` and `while not done:` drop
+        the double negative and become `IF (x)`.
+        """
+        t = self.t
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return f"({t._truth(node.operand)})"
+        return f"NOT ({t._truth(node)})"
 
     def _emit_if_recursive(self, node):
         t = self.t
-        cond = t._expr(node.test)
+        skip = self._skip_test(node.test)
         has_else = bool(node.orelse)
 
         # Reserve the conditional jump line
@@ -293,22 +340,18 @@ class Basic2Dialect(DialectEmitter):
             # Simple if: jump past body if condition false
             past_body = t.lines.peek()
             t._note_forward_target(past_body)
-            t.emitter.emit(cond_ln, f"IF NOT ({cond}) THEN GOTO {past_body}")
+            t.emitter.emit(cond_ln, f"IF {skip} THEN GOTO {past_body}")
         else:
             # Need a GOTO to skip the else after body executes
             skip_else_ln = t.lines.next()
 
+            else_start = t.lines.peek()
+            t._note_forward_target(else_start)
+            t.emitter.emit(cond_ln, f"IF {skip} THEN GOTO {else_start}")
             if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
                 # elif chain
-                else_start = t.lines.peek()
-                t._note_forward_target(else_start)
-                t.emitter.emit(cond_ln, f"IF NOT ({cond}) THEN GOTO {else_start}")
                 self._emit_if_recursive(node.orelse[0])
             else:
-                # else block
-                else_start = t.lines.peek()
-                t._note_forward_target(else_start)
-                t.emitter.emit(cond_ln, f"IF NOT ({cond}) THEN GOTO {else_start}")
                 for stmt in node.orelse:
                     t.visit(stmt)
 
@@ -322,14 +365,17 @@ class Basic2Dialect(DialectEmitter):
 
     def emit_while(self, node):
         t = self.t
-        # Top of loop — GOTO target
-        top_ln = t.lines.next()
-        t.emitter.emit(top_ln, "REM")
-
-        cond = t._expr(node.test)
-
-        # Conditional exit placeholder
-        cond_ln = t.lines.next()
+        skip = None
+        if t._is_true_const(node.test):
+            # while True: has no exit test, so the first body line is the
+            # top of the loop; only break leaves it.
+            top_ln = t.lines.peek()
+            cond_ln = None
+        else:
+            # The conditional exit is itself the top of the loop, so the
+            # back edge and continue jump straight to it.
+            skip = self._skip_test(node.test)
+            top_ln = cond_ln = t.lines.next()
 
         # Push break context
         t._break_frames.append({"kind": "while", "lines": [], "continues": []})
@@ -344,7 +390,8 @@ class Basic2Dialect(DialectEmitter):
         # End of loop
         end_ln = t.lines.peek()
         t._note_forward_target(end_ln)
-        t.emitter.emit(cond_ln, f"IF NOT ({cond}) THEN GOTO {end_ln}")
+        if cond_ln is not None:
+            t.emitter.emit(cond_ln, f"IF {skip} THEN GOTO {end_ln}")
 
         frame = t._break_frames.pop()
         for bln in frame["lines"]:
@@ -366,51 +413,48 @@ class Basic2Dialect(DialectEmitter):
         return "BASIC 2.0"
 
 
-class Basic65Dialect(DialectEmitter):
+class _StructuredDialect(DialectEmitter):
     """
-    BASIC 65 (MEGA65) — civilised structured programming.
-    BEGIN/BEND, DO WHILE/LOOP, MOD(), SLEEP, UPPER$/LOWER$, INSTR, HEX$.
+    What BASIC 7.0 and BASIC 65 share: BEGIN/BEND blocks, DO/LOOP with
+    EXIT, INSTR, HEX$/DEC and the XOR() function.
     """
 
-    has_string_case = True
     has_instr = True
     has_hex = True
+    has_xor = True
+    #: The C128 and MEGA65 editors take 160-character lines.
+    max_line_length = 160
 
     def _emit_if_recursive(self, node):
         t = self.t
-        cond = t._expr(node.test)
-        has_else = bool(node.orelse)
-
-        if not has_else:
-            t._emit(f"IF {cond} THEN BEGIN")
-            for stmt in node.body:
-                t.visit(stmt)
+        t._emit(f"IF {t._truth(node.test)} THEN BEGIN")
+        for stmt in node.body:
+            t.visit(stmt)
+        if not node.orelse:
             t._emit("BEND")
-        elif len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
-            t._emit(f"IF {cond} THEN BEGIN")
-            for stmt in node.body:
-                t.visit(stmt)
-            t._emit("BEND ELSE BEGIN")
+            return
+        # ELSE must follow BEND on the same line, after a colon.
+        t._emit("BEND : ELSE BEGIN")
+        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
             self._emit_if_recursive(node.orelse[0])
-            t._emit("BEND")
         else:
-            t._emit(f"IF {cond} THEN BEGIN")
-            for stmt in node.body:
-                t.visit(stmt)
-            t._emit("BEND ELSE BEGIN")
             for stmt in node.orelse:
                 t.visit(stmt)
-            t._emit("BEND")
+        t._emit("BEND")
 
     def emit_if(self, node):
         self._emit_if_recursive(node)
 
     def emit_while(self, node):
         t = self.t
-        cond = t._expr(node.test)
-        # DO WHILE <cond> ... LOOP tests at the TOP, matching Python's while.
-        # DO ... LOOP WHILE <cond> would be a do-while and always run once.
-        t._emit(f"DO WHILE {cond}")
+        if t._is_true_const(node.test):
+            # while True: is a bare DO ... LOOP, left only by EXIT.
+            t._emit("DO")
+        else:
+            # DO WHILE <cond> ... LOOP tests at the TOP, matching Python's
+            # while. DO ... LOOP WHILE <cond> would be a do-while and
+            # always run once.
+            t._emit(f"DO WHILE {t._truth(node.test)}")
         t._break_frames.append({"kind": "while", "lines": [], "continues": []})
         for stmt in node.body:
             t.visit(stmt)
@@ -423,6 +467,16 @@ class Basic65Dialect(DialectEmitter):
 
     def emit_break(self, _node):
         self.t._emit("EXIT")
+
+
+class Basic65Dialect(_StructuredDialect):
+    """
+    BASIC 65 (MEGA65) — civilised structured programming.
+    BEGIN/BEND, DO WHILE/LOOP, MOD(), SLEEP, UPPER$/LOWER$, INSTR, HEX$.
+    """
+
+    has_string_case = True
+    has_mod = True
 
     def emit_modulo(self, left, right):
         return f"MOD({left}, {right})"
@@ -434,73 +488,29 @@ class Basic65Dialect(DialectEmitter):
         return "BASIC 65"
 
 
-class Basic7Dialect(DialectEmitter):
+class Basic7Dialect(_StructuredDialect):
     """
     BASIC 7.0 (C128) — structured flow, unstructured math.
 
     Shares BEGIN/BEND IF and DO/LOOP WHILE with BASIC 65.
     No MOD() function — faked with INT() like BASIC 2.0.
-    No SLEEP — faked with a FOR/NEXT delay loop.
+    SLEEP takes whole seconds only; anything else is a FOR/NEXT delay loop.
     Has INSTR and HEX$/DEC.
     EXIT works for DO/LOOP break.
     """
-
-    has_instr = True
-    has_hex = True
-
-    def _emit_if_recursive(self, node):
-        t = self.t
-        cond = t._expr(node.test)
-        has_else = bool(node.orelse)
-
-        if not has_else:
-            t._emit(f"IF {cond} THEN BEGIN")
-            for stmt in node.body:
-                t.visit(stmt)
-            t._emit("BEND")
-        elif len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
-            t._emit(f"IF {cond} THEN BEGIN")
-            for stmt in node.body:
-                t.visit(stmt)
-            t._emit("BEND ELSE BEGIN")
-            self._emit_if_recursive(node.orelse[0])
-            t._emit("BEND")
-        else:
-            t._emit(f"IF {cond} THEN BEGIN")
-            for stmt in node.body:
-                t.visit(stmt)
-            t._emit("BEND ELSE BEGIN")
-            for stmt in node.orelse:
-                t.visit(stmt)
-            t._emit("BEND")
-
-    def emit_if(self, node):
-        self._emit_if_recursive(node)
-
-    def emit_while(self, node):
-        t = self.t
-        cond = t._expr(node.test)
-        # DO WHILE ... LOOP tests at the top; DO ... LOOP WHILE would not.
-        t._emit(f"DO WHILE {cond}")
-        t._break_frames.append({"kind": "while", "lines": [], "continues": []})
-        for stmt in node.body:
-            t.visit(stmt)
-        frame = t._break_frames.pop()
-        loop_ln = t._emit("LOOP")
-        # There is no CONTINUE statement, so jump to the LOOP, which
-        # branches back to the top and re-tests.
-        for cln in frame["continues"]:
-            t.emitter.emit(cln, f"GOTO {loop_ln}")
-
-    def emit_break(self, _node):
-        self.t._emit("EXIT")
 
     def emit_modulo(self, left, right):
         # BASIC 7.0 has no MOD() — fake it like BASIC 2.0
         return _fake_mod(left, right)
 
     def emit_sleep(self, seconds_expr):
-        self.t.emit_delay_loop(seconds_expr)
+        # SLEEP n takes whole seconds from 0 to 65535. A fraction or a
+        # runtime expression falls back to the delay loop.
+        seconds = self.t._static_num_from_text(seconds_expr)
+        if seconds is not None and seconds == int(seconds) and 0 <= seconds <= 65535:
+            self.t._emit(f"SLEEP {int(seconds)}")
+        else:
+            self.t.emit_delay_loop(seconds_expr)
 
     def dialect_name(self):
         return "BASIC 7.0"
@@ -569,6 +579,21 @@ class Transpiler(ast.NodeVisitor):
         ast.GtE: ">=",
     }
 
+    #: Python binary operators with a direct BASIC spelling.
+    BINARY_OPS: ClassVar[dict] = {
+        ast.Add: "+",
+        ast.Sub: "-",
+        ast.Mult: "*",
+        ast.Div: "/",
+        ast.Pow: "^",
+    }
+
+    #: Modules that may be imported. Only a few of their names map to BASIC.
+    SUPPORTED_MODULES = frozenset({"time", "sys", "math", "random", "py2basic_runtime"})
+
+    #: Characters that cannot sit inside a BASIC string literal.
+    STRING_CODES: ClassVar[dict] = {'"': "CHR$(34)", "\n": "CHR$(13)"}
+
     #: name -> (min_args, max_args, BASIC statement template)
     STATEMENT_INTRINSICS: ClassVar[dict] = {
         "poke": (2, 2, "POKE {0}, {1}"),
@@ -580,11 +605,13 @@ class Transpiler(ast.NodeVisitor):
         "basic": (1, 1, None),  # raw escape hatch
     }
 
-    def __init__(self, dialect=None):
+    def __init__(self, dialect=None, start=10, step=10):
         self.sym = SymbolTable()
-        self.lines = LineAllocator()
+        self.lines = LineAllocator(start, step)
         self.emitter = Emitter()
         self._string_vars = set()
+        #: Names of lists whose elements are strings, known before DIM.
+        self._string_lists = set()
         #: py name -> (basic_name, size, is_string)
         self._arrays = {}
         #: py name -> (basic_fn_name, param_py_name)
@@ -595,9 +622,18 @@ class Transpiler(ast.NodeVisitor):
         self._toplevel_defs = set()
         self._break_frames = []
         self._forward_targets = set()
-        self._math_aliases = {"math"}
-        self._random_aliases = {"random"}
-        self.dialect = dialect or Basic2Dialect(self)
+        #: local name -> module, for `import x` and `import x as y`.
+        self._modules = {name: name for name in self.SUPPORTED_MODULES}
+        #: local name -> (module, attribute), for `from x import y [as z]`.
+        self._from_imports = {}
+        # A dialect emits through the transpiler, so the natural argument
+        # is the class; an instance built elsewhere is accepted as well.
+        if dialect is None:
+            self.dialect = Basic2Dialect(self)
+        elif isinstance(dialect, type):
+            self.dialect = dialect(self)
+        else:
+            self.dialect = dialect
 
     # ── Type inference ─────────────────────────────────────────────────────────
 
@@ -620,8 +656,11 @@ class Transpiler(ast.NodeVisitor):
             return False
         if isinstance(node, ast.Subscript):
             base = node.value
-            if isinstance(base, ast.Name) and base.id in self._arrays:
-                return self._arrays[base.id][2]
+            if isinstance(base, ast.Name):
+                if base.id in self._arrays:
+                    return self._arrays[base.id][2]
+                if base.id in self._string_lists:
+                    return True
             # A slice of a string is a string.
             return self._is_string_expr(base)
         if isinstance(node, ast.Call):
@@ -669,7 +708,7 @@ class Transpiler(ast.NodeVisitor):
                 return inner
         return None
 
-    def _list_literal(self, value):
+    def _list_literal(self, value, lineno=0):
         """
         Describe a list-shaped initialiser, or None if it is not one.
 
@@ -685,23 +724,56 @@ class Transpiler(ast.NodeVisitor):
                 (value.left, value.right),
                 (value.right, value.left),
             ):
-                if isinstance(lst, ast.List) and len(lst.elts) == 1:
-                    size = self._static_num(count)
-                    if size is None or size < 1 or size != int(size):
-                        return None
-                    return None, (lst.elts[0], int(size))
+                if not isinstance(lst, ast.List):
+                    continue
+                if len(lst.elts) != 1:
+                    raise TranspilerError(
+                        "Only a one-element list can be repeated, e.g. [0] * 10.",
+                        lineno,
+                    )
+                size = self._static_num(count)
+                if size is None:
+                    raise TranspilerError(
+                        "List size must be a literal number: BASIC arrays are "
+                        "sized by DIM when the program starts, e.g. [0] * 10.",
+                        lineno,
+                    )
+                if size < 1 or size != int(size):
+                    raise TranspilerError(
+                        f"List size must be a positive whole number, not {size}.",
+                        lineno,
+                    )
+                return None, (lst.elts[0], int(size))
         return None
 
-    def _assign_pairs(self, tree):
-        """Yield (target_names, value_node, lineno) for every assignment."""
+    def _collect_assignments(self, tree):
+        """
+        Every assignment in the program, split into scalar assignments
+        (names, value, lineno) and list declarations (name, sample element).
+        """
+        pairs = []
+        lists = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign):
                 names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                if not names:
+                    continue
+                lineno = getattr(node, "lineno", 0)
+                shape = self._list_literal(node.value, lineno)
+                if shape is None:
+                    pairs.append((names, node.value, lineno))
+                    continue
                 # A list initialiser types the array, not a scalar.
-                if names and self._list_literal(node.value) is None:
-                    yield names, node.value, getattr(node, "lineno", 0)
+                elements, fill = shape
+                if fill is not None:
+                    sample = fill[0]
+                else:
+                    sample = elements[0] if elements else None
+                if sample is not None:
+                    lists.extend((name, sample) for name in names)
             elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
-                yield [node.target.id], node.value, getattr(node, "lineno", 0)
+                pairs.append(([node.target.id], node.value, getattr(node, "lineno", 0)))
+        return pairs, lists
 
     def _infer_string_vars(self, tree):
         """
@@ -711,8 +783,11 @@ class Transpiler(ast.NodeVisitor):
         lets `b = "y" + a` mark b, and so on. A single pass sees only the
         first of those and would emit `B = "y" + A$` — a numeric variable
         holding a string, which is a ?TYPE MISMATCH ERROR on real hardware.
+
+        Lists take part too: `names = ["a"]` makes `names` a string list,
+        so `n = names[0]` makes n a string.
         """
-        pairs = list(self._assign_pairs(tree))
+        pairs, lists = self._collect_assignments(tree)
 
         changed = True
         while changed:
@@ -724,6 +799,10 @@ class Transpiler(ast.NodeVisitor):
                     if name not in self._string_vars:
                         self._string_vars.add(name)
                         changed = True
+            for name, sample in lists:
+                if name not in self._string_lists and self._is_string_expr(sample):
+                    self._string_lists.add(name)
+                    changed = True
 
         # Catch variables used as both — BASIC has no such thing.
         for names, value, lineno in pairs:
@@ -818,9 +897,13 @@ class Transpiler(ast.NodeVisitor):
         if upper is None:
             return f"MID$({target}, {start})"
         if up_const is not None and up_const < 0:
-            raise TranspilerError(
-                "A negative slice end is supported only as s[:-n].", lineno
-            )
+            # s[a:-n] -> MID$(S$, a + 1, LEN(S$) - n - a)
+            drop = int(-up_const)
+            if low_const is not None:
+                length = f"LEN({target}) - {drop + int(low_const)}"
+            else:
+                length = f"LEN({target}) - {drop} - {_atom(self._expr(lower))}"
+            return f"MID$({target}, {start}, {length})"
         # Length is upper - lower.
         if low_const is not None and up_const is not None:
             length = str(int(up_const - low_const))
@@ -840,29 +923,41 @@ class Transpiler(ast.NodeVisitor):
             return self.sym.get_string(py_name)
         return self.sym.get_numeric(py_name)
 
-    def _escape_commodore_string(self, s: str) -> str:
+    def _escape_commodore_string(self, s: str, lineno: int = 0) -> str:
         """
-        Convert a Python string containing double quotes into a BASIC
-        string expression using CHR$(34) for the quotes.
+        Spell a Python string as a BASIC string expression.
 
-        Returns a complete BASIC expression (not just the inner part),
-        so callers must NOT wrap it in additional quotes.
+        A double quote cannot sit inside a BASIC string literal, and a
+        newline would end the program line, so each becomes a CHR$() call
+        spliced in with +. Returns a complete BASIC expression, so callers
+        must NOT wrap it in additional quotes.
 
         Examples:
           'hello'          -> '"hello"'
           'say "hi"'       -> '"say " + CHR$(34) + "hi" + CHR$(34)'
           '"quoted"'       -> 'CHR$(34) + "quoted" + CHR$(34)'
+          'a\\nb'           -> '"a" + CHR$(13) + "b"'
         """
-        if '"' not in s:
-            return f'"{s}"'
-        # Split on embedded quotes, filter empty segments, join with CHR$(34)
-        segments = s.split('"')
+        for ch in s:
+            if ord(ch) < 32 and ch not in self.STRING_CODES:
+                raise TranspilerError(
+                    f"Control character {ch!r} in a string literal has no "
+                    f"BASIC spelling here; concatenate chr(n) instead.",
+                    lineno,
+                )
         parts = []
-        for i, seg in enumerate(segments):
-            if seg:
-                parts.append(f'"{seg}"')
-            if i < len(segments) - 1:
-                parts.append("CHR$(34)")
+        run = []
+        for ch in s:
+            code = self.STRING_CODES.get(ch)
+            if code is None:
+                run.append(ch)
+                continue
+            if run:
+                parts.append('"' + "".join(run) + '"')
+                run = []
+            parts.append(code)
+        if run:
+            parts.append('"' + "".join(run) + '"')
         return " + ".join(parts) if parts else '""'
 
     # ── Expression compiler ────────────────────────────────────────────────────
@@ -874,7 +969,9 @@ class Transpiler(ast.NodeVisitor):
             if isinstance(node.value, (int, float)):
                 return str(node.value)
             if isinstance(node.value, str):
-                return self._escape_commodore_string(node.value)
+                return self._escape_commodore_string(
+                    node.value, getattr(node, "lineno", 0)
+                )
             raise TranspilerError(
                 f"Unsupported constant: {type(node.value)}", getattr(node, "lineno", 0)
             )
@@ -896,6 +993,7 @@ class Transpiler(ast.NodeVisitor):
 
         if isinstance(node, ast.BinOp):
             op = node.op
+            lineno = getattr(node, "lineno", 0)
             # String % formatting: "Hello %s" % name  or  "Hi %s %s" % (a, b)
             # Must check before evaluating left/right so we can inspect AST types.
             if (
@@ -903,43 +1001,46 @@ class Transpiler(ast.NodeVisitor):
                 and isinstance(node.left, ast.Constant)
                 and isinstance(node.left.value, str)
             ):
-                return self._expand_percent_format(
-                    node.left.value, node.right, getattr(node, "lineno", 0)
-                )
-            left = self._expr(node.left)
-            right = self._expr(node.right)
-            if isinstance(op, ast.Add):
-                return f"{left} + {right}"
-            if isinstance(op, ast.Sub):
-                return f"{left} - {right}"
-            if isinstance(op, ast.Mult):
-                return f"{left} * {right}"
-            if isinstance(op, ast.Div):
-                return f"{left} / {right}"
-            if isinstance(op, ast.FloorDiv):
-                return f"INT({left} / {right})"
+                return self._expand_percent_format(node.left.value, node.right, lineno)
             if isinstance(op, ast.Mod):
-                return self.dialect.emit_modulo(left, right)
-            if isinstance(op, ast.Pow):
-                return f"{left} ^ {right}"
-            if isinstance(op, ast.BitAnd):
-                return f"({left}) AND ({right})"
-            if isinstance(op, ast.BitOr):
-                return f"({left}) OR ({right})"
-            if isinstance(op, ast.BitXor):
-                return f"({left}) XOR ({right})"
-            raise TranspilerError(
-                f"Unsupported operator: {type(op).__name__}", getattr(node, "lineno", 0)
-            )
+                # emit_modulo adds whatever parentheses its spelling needs.
+                return self.dialect.emit_modulo(
+                    self._expr(node.left), self._expr(node.right)
+                )
+            if isinstance(op, ast.FloorDiv):
+                left = self._operand(node.left, _PREC_MUL)
+                right = self._operand(node.right, _PREC_MUL, right=True)
+                return f"INT({left} / {right})"
+            if isinstance(op, (ast.BitAnd, ast.BitOr, ast.BitXor)):
+                left = self._expr(node.left)
+                right = self._expr(node.right)
+                if isinstance(op, ast.BitXor):
+                    # XOR is a function in BASIC 7.0 and 65, and absent in 2.0.
+                    self._require("has_xor", lineno, "XOR()")
+                    return f"XOR({left}, {right})"
+                word = "AND" if isinstance(op, ast.BitAnd) else "OR"
+                return f"({left}) {word} ({right})"
+            symbol = self.BINARY_OPS.get(type(op))
+            if symbol is None:
+                raise TranspilerError(
+                    f"Unsupported operator: {type(op).__name__}", lineno
+                )
+            prec = _BINOP_PREC[type(op)]
+            left = self._operand(node.left, prec)
+            right = self._operand(node.right, prec, right=True)
+            return f"{left} {symbol} {right}"
 
         if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.Not):
+                return f"NOT ({self._truth(node.operand)})"
+            if isinstance(node.op, ast.Invert):
+                # BASIC's NOT is bitwise: NOT x is -(x + 1), exactly ~x.
+                return f"NOT ({self._expr(node.operand)})"
             operand = self._expr(node.operand)
             if isinstance(node.op, ast.USub):
                 return f"-{_atom(operand)}"
             if isinstance(node.op, ast.UAdd):
                 return operand
-            if isinstance(node.op, ast.Not):
-                return f"NOT ({operand})"
             raise TranspilerError(
                 f"Unsupported unary op: {type(node.op).__name__}",
                 getattr(node, "lineno", 0),
@@ -947,7 +1048,7 @@ class Transpiler(ast.NodeVisitor):
 
         if isinstance(node, ast.BoolOp):
             op = "AND" if isinstance(node.op, ast.And) else "OR"
-            parts = [f"({self._expr(v)})" for v in node.values]
+            parts = [f"({self._truth(v)})" for v in node.values]
             return f" {op} ".join(parts)
 
         if isinstance(node, ast.Compare):
@@ -971,6 +1072,79 @@ class Transpiler(ast.NodeVisitor):
             f"Unsupported expression: {type(node).__name__}", getattr(node, "lineno", 0)
         )
 
+    # ── Precedence and truth ───────────────────────────────────────────────────
+
+    def _prec(self, node):
+        """Precedence of the BASIC text _expr(node) produces; higher binds tighter."""
+        if isinstance(node, ast.BinOp):
+            op = node.op
+            if isinstance(op, ast.Mod):
+                is_format = isinstance(node.left, ast.Constant) and isinstance(
+                    node.left.value, str
+                )
+                if is_format or not self.dialect.has_mod:
+                    # Concatenation, or the a - INT(a / b) * b fake.
+                    return _PREC_ADD
+                return _PREC_ATOM
+            if isinstance(op, (ast.FloorDiv, ast.BitXor)):
+                return _PREC_ATOM  # INT(...) and XOR(...)
+            if isinstance(op, ast.BitAnd):
+                return _PREC_AND
+            if isinstance(op, ast.BitOr):
+                return _PREC_OR
+            return _BINOP_PREC.get(type(op), _PREC_ATOM)
+        if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, (ast.Not, ast.Invert)):
+                return _PREC_NOT
+            if isinstance(node.op, ast.UAdd):
+                return self._prec(node.operand)
+            return _PREC_NEG
+        if isinstance(node, ast.BoolOp):
+            return _PREC_AND if isinstance(node.op, ast.And) else _PREC_OR
+        if isinstance(node, ast.Compare):
+            # A chain becomes (a < b) AND (b < c).
+            return _PREC_AND if len(node.ops) > 1 else _PREC_CMP
+        if isinstance(node, ast.JoinedStr):
+            return _PREC_ADD
+        return _PREC_ATOM
+
+    def _operand(self, node, prec, *, right=False):
+        """
+        Compile node as an operand of an operator of precedence prec,
+        parenthesised when BASIC would otherwise bind it differently.
+
+        A right operand of equal precedence is always parenthesised: that
+        keeps a - (b - c) and 2 ** (3 ** 2) meaning what they say.
+        """
+        text = self._expr(node)
+        own = self._prec(node)
+        if own < prec or (right and own == prec):
+            return f"({text})"
+        return text
+
+    def _truth(self, node):
+        """
+        Compile node as a condition that is exactly 0 or -1.
+
+        BASIC's AND, OR and NOT are bitwise, so they are only safe on
+        operands that are already proper booleans. A bare value has to be
+        compared with zero first: NOT 3 is -4, which is true, so a plain
+        `while n:` would exit at once on BASIC 2.0 and `if x and y:` with
+        5 and 2 would be false everywhere.
+        """
+        if isinstance(node, (ast.Compare, ast.BoolOp)):
+            return self._expr(node)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return self._expr(node)
+        if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+            return self._expr(node)
+        zero = '""' if self._is_string_expr(node) else "0"
+        return f"{self._operand(node, _PREC_CMP)} <> {zero}"
+
+    @staticmethod
+    def _is_true_const(node):
+        return isinstance(node, ast.Constant) and node.value is True
+
     # ── Emitter helpers ────────────────────────────────────────────────────────
 
     def _emit(self, text):
@@ -980,7 +1154,7 @@ class Transpiler(ast.NodeVisitor):
 
     def _declare_array(self, py_name, value, lineno):
         """Compile a list assignment into DIM plus element initialisers."""
-        shape = self._list_literal(value)
+        shape = self._list_literal(value, lineno)
         if shape is None:
             return False
         elements, fill = shape
@@ -1056,10 +1230,12 @@ class Transpiler(ast.NodeVisitor):
 
     @staticmethod
     def _static_num_from_text(expr):
+        """The finite number expr spells, or None."""
         try:
-            return float(expr)
+            value = float(expr)
         except ValueError:
             return None
+        return value if math.isfinite(value) else None
 
     def emit_delay_loop(self, seconds_expr):
         """
@@ -1123,8 +1299,8 @@ class Transpiler(ast.NodeVisitor):
                 raise TranspilerError(
                     f"Unsupported comparison: {type(op).__name__}", lineno
                 )
-            left = self._expr(left_node)
-            right = self._expr(right_node)
+            left = self._operand(left_node, _PREC_CMP)
+            right = self._operand(right_node, _PREC_CMP, right=True)
             parts.append(f"{left} {basic_op} {right}")
 
         if len(parts) == 1:
@@ -1167,15 +1343,8 @@ class Transpiler(ast.NodeVisitor):
                 spec = part[1]  # the letter after %
 
                 if spec == "s":
-                    # String: if already a string type, use directly; else STR$()
-                    is_str = (
-                        isinstance(arg_node, ast.Constant)
-                        and isinstance(arg_node.value, str)
-                    ) or (
-                        isinstance(arg_node, ast.Name)
-                        and arg_node.id in self._string_vars
-                    )
-                    if is_str:
+                    # Already a string: use it directly; otherwise STR$().
+                    if self._is_string_expr(arg_node):
                         result_parts.append(self._expr(arg_node))
                     else:
                         result_parts.append(f"STR$({self._expr(arg_node)})")
@@ -1238,25 +1407,7 @@ class Transpiler(ast.NodeVisitor):
                     )
 
                 expr = self._expr(value.value)
-
-                # Determine if the expression is already a string
-                is_str = (
-                    (
-                        isinstance(value.value, ast.Constant)
-                        and isinstance(value.value.value, str)
-                    )
-                    or (
-                        isinstance(value.value, ast.Name)
-                        and value.value.id in self._string_vars
-                    )
-                    or (
-                        isinstance(value.value, ast.Call)
-                        and isinstance(value.value.func, ast.Name)
-                        and value.value.func.id in {"str", "chr", "input"}
-                    )
-                )
-
-                if is_str:
+                if self._is_string_expr(value.value):
                     parts.append(expr)
                 else:
                     parts.append(f"STR$({expr})")
@@ -1294,6 +1445,10 @@ class Transpiler(ast.NodeVisitor):
             if args:
                 raise TranspilerError("random.random() takes no arguments.", lineno)
             return "RND(1)"
+        if attr == "seed":
+            raise TranspilerError(
+                "random.seed() is a statement; call it on its own line.", lineno
+            )
         if attr in ("randint", "randrange"):
             if attr == "randint":
                 if len(args) != 2:
@@ -1373,10 +1528,17 @@ class Transpiler(ast.NodeVisitor):
                     )
                 fn_basic = self._fn_defs[name][0]
                 return f"{fn_basic}({self._expr(node.args[0])})"
+            if name in self._from_imports:
+                module, attr = self._from_imports[name]
+                return self._module_expr(module, attr, node, lineno)
             if name in self.BUILTINS:
                 return self._builtin_expr(name, node, lineno)
             if name == "input":
-                raise TranspilerError("input() can't be used as expression.", lineno)
+                raise TranspilerError(
+                    "input() can't be used inside an expression. Use "
+                    "var = input(...) or var = int(input(...)) on its own line.",
+                    lineno,
+                )
             if name in self._functions:
                 raise TranspilerError(
                     f"'{name}()' is a subroutine with no return value.", lineno
@@ -1389,15 +1551,8 @@ class Transpiler(ast.NodeVisitor):
             obj = node.func.value
             attr = node.func.attr
             if isinstance(obj, ast.Name):
-                if obj.id in self._random_aliases:
-                    return self._random_expr(attr, node, lineno)
-                # math.sqrt(x) and friends — same table as the bare names.
-                if obj.id in self._math_aliases:
-                    if attr in self.BUILTINS:
-                        return self._builtin_expr(attr, node, lineno)
-                    raise TranspilerError(
-                        f"math.{attr}() has no BASIC equivalent.", lineno
-                    )
+                if obj.id in self._modules:
+                    return self._module_expr(self._modules[obj.id], attr, node, lineno)
                 if attr in ("find", "index"):
                     self._require("has_instr", lineno, "str.find() (INSTR)")
                     if len(node.args) != 1:
@@ -1421,6 +1576,50 @@ class Transpiler(ast.NodeVisitor):
             raise TranspilerError(f"Unsupported method: .{node.func.attr}()", lineno)
 
         raise TranspilerError(f"Unsupported call: {ast.dump(node)}", lineno)
+
+    def _module_expr(self, module, attr, node, lineno):
+        """A call on one of the supported modules, in expression position."""
+        if module == "random":
+            return self._random_expr(attr, node, lineno)
+        if module in ("math", "py2basic_runtime") and attr in self.BUILTINS:
+            # math.sqrt(x) and friends share the table with the bare names.
+            return self._builtin_expr(attr, node, lineno)
+        if module == "math":
+            raise TranspilerError(f"math.{attr}() has no BASIC equivalent.", lineno)
+        raise TranspilerError(
+            f"{module}.{attr}() has no value here; "
+            f"use it as a statement on its own line.",
+            lineno,
+        )
+
+    def _module_stmt(self, module, attr, node, lineno):
+        """A call on one of the supported modules, in statement position."""
+        if module == "time" and attr == "sleep":
+            if len(node.args) != 1 or node.keywords:
+                raise TranspilerError("time.sleep() takes exactly 1 argument.", lineno)
+            self.dialect.emit_sleep(self._expr(node.args[0]))
+            return
+        if module == "sys" and attr == "exit":
+            self._emit("END")
+            return
+        if module == "random" and attr == "seed":
+            if len(node.args) != 1 or node.keywords:
+                raise TranspilerError("random.seed() takes exactly 1 argument.", lineno)
+            # RND(<negative>) reseeds; the result has to land somewhere,
+            # so it goes in a scratch variable.
+            scratch = self.sym.get_numeric("__rnd_seed")
+            seed = self._expr(node.args[0])
+            self._emit(f"{scratch} = RND(-ABS({seed}))")
+            return
+        if module == "py2basic_runtime" and attr in self.STATEMENT_INTRINSICS:
+            self._emit_intrinsic(attr, node, lineno)
+            return
+        if module in ("math", "random", "py2basic_runtime"):
+            raise TranspilerError(
+                f"{module}.{attr}() returns a value; assign it to a variable.",
+                lineno,
+            )
+        raise TranspilerError(f"{module}.{attr}() is not supported.", lineno)
 
     def _emit_at(self, line_num, text):
         self.emitter.emit(line_num, text)
@@ -1450,8 +1649,10 @@ class Transpiler(ast.NodeVisitor):
         """True if node maps onto BASIC's DEF FN rather than GOSUB."""
         a = node.args
         return (
-            len(a.args) == 1
-            and not (a.vararg or a.kwarg or a.kwonlyargs or a.defaults)
+            not node.decorator_list
+            and len(a.args) == 1
+            and not (a.posonlyargs or a.vararg or a.kwarg or a.kwonlyargs)
+            and not a.defaults
             and self._fn_body_expr(node) is not None
         )
 
@@ -1548,7 +1749,14 @@ class Transpiler(ast.NodeVisitor):
                 f"BASIC subroutines cannot be nested or conditional.",
                 lineno,
             )
-        if node.args.args or node.args.vararg or node.args.kwarg:
+        if node.decorator_list:
+            raise TranspilerError(
+                f"Function '{node.name}' has a decorator, which has no "
+                f"meaning in BASIC.",
+                lineno,
+            )
+        a = node.args
+        if a.args or a.posonlyargs or a.vararg or a.kwonlyargs or a.kwarg:
             raise TranspilerError(
                 f"Function '{node.name}' has parameters. Only a single-"
                 f"expression numeric function (def f(x): return ...) can "
@@ -1585,13 +1793,15 @@ class Transpiler(ast.NodeVisitor):
     def _emit_print(self, node, lineno):
         """Compile print(), including its sep= and end= keywords."""
         sep = " ; "
+        explicit_sep = False
         suppress_newline = False
 
         for kw in node.keywords:
             if kw.arg == "sep":
+                explicit_sep = True
                 text = self._const_str_kwarg(kw, lineno)
                 if text:
-                    sep = f" ; {self._escape_commodore_string(text)} ; "
+                    sep = f" ; {self._escape_commodore_string(text, lineno)} ; "
             elif kw.arg == "end":
                 text = self._const_str_kwarg(kw, lineno)
                 if text == "":
@@ -1605,7 +1815,19 @@ class Transpiler(ast.NodeVisitor):
             else:
                 raise TranspilerError(f"print({kw.arg}=...) is not supported.", lineno)
 
-        parts = [self._expr(a) for a in node.args]
+        parts = []
+        for index, arg in enumerate(node.args):
+            if (
+                index
+                and not explicit_sep
+                and self._is_string_expr(arg)
+                and self._is_string_expr(node.args[index - 1])
+            ):
+                # PRINT "a" ; "b" runs the strings together where Python
+                # puts a space between them. Numbers need no help: BASIC
+                # prints them with a space on either side already.
+                parts.append('" "')
+            parts.append(self._expr(arg))
         stmt = "PRINT" if not parts else f"PRINT {sep.join(parts)}"
         if suppress_newline:
             # A trailing ; leaves the cursor where it is, like end="".
@@ -1680,13 +1902,18 @@ class Transpiler(ast.NodeVisitor):
             if name == "input":
                 raise TranspilerError("Use: var = input('prompt')", lineno)
 
+            if name in self._from_imports:
+                module, attr = self._from_imports[name]
+                self._module_stmt(module, attr, node, lineno)
+                return
+
             if name == "sleep":
                 if len(node.args) != 1:
                     raise TranspilerError("sleep() takes exactly 1 argument.", lineno)
                 self.dialect.emit_sleep(self._expr(node.args[0]))
                 return
 
-            if name == "exit":
+            if name in ("exit", "quit"):
                 self._emit("END")
                 return
 
@@ -1712,29 +1939,10 @@ class Transpiler(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute):
             obj = node.func.value
             attr = node.func.attr
-            if isinstance(obj, ast.Name):
-                if obj.id == "time" and attr == "sleep":
-                    if len(node.args) != 1:
-                        raise TranspilerError(
-                            "time.sleep() takes exactly 1 argument.", lineno
-                        )
-                    self.dialect.emit_sleep(self._expr(node.args[0]))
-                    return
-                if obj.id == "sys" and attr == "exit":
-                    self._emit("END")
-                    return
-                if obj.id in self._random_aliases and attr == "seed":
-                    if len(node.args) != 1:
-                        raise TranspilerError(
-                            "random.seed() takes exactly 1 argument.", lineno
-                        )
-                    # RND(<negative>) reseeds; the result has to land
-                    # somewhere, so it goes in a scratch variable.
-                    scratch = self.sym.get_numeric("__rnd_seed")
-                    seed = self._expr(node.args[0])
-                    self._emit(f"{scratch} = RND(-ABS({seed}))")
-                    return
-            raise TranspilerError(f"Unsupported method call: {ast.dump(node)}", lineno)
+            if isinstance(obj, ast.Name) and obj.id in self._modules:
+                self._module_stmt(self._modules[obj.id], attr, node, lineno)
+                return
+            raise TranspilerError(f"Unsupported method call: .{attr}()", lineno)
 
         raise TranspilerError(f"Unsupported call: {ast.dump(node)}", lineno)
 
@@ -1757,66 +1965,100 @@ class Transpiler(ast.NodeVisitor):
                 f"Bare expression not supported: {ast.dump(node.value)}", node.lineno
             )
 
-    def visit_Assign(self, node):
-        if len(node.targets) != 1:
-            raise TranspilerError(
-                "Multiple assignment targets not supported", node.lineno
-            )
-        target = node.targets[0]
+    @staticmethod
+    def _is_call_to(node, names):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in names
+        )
 
+    def _input_call(self, value, lineno):
+        """
+        Recognise `input(prompt)`, `int(input(prompt))` and
+        `float(input(prompt))`, the three ways a program reads a line.
+
+        Returns (True, prompt_node_or_None) for one of those, else
+        (False, None). BASIC's INPUT reads a number straight into a
+        numeric variable, so the int()/float() wrapper costs nothing.
+        """
+        call = value
+        if (
+            self._is_call_to(call, ("int", "float"))
+            and len(call.args) == 1
+            and not call.keywords
+            and self._is_call_to(call.args[0], ("input",))
+        ):
+            call = call.args[0]
+        if not self._is_call_to(call, ("input",)):
+            return False, None
+        if len(call.args) > 1 or call.keywords:
+            raise TranspilerError("input() takes at most one prompt.", lineno)
+        return True, (call.args[0] if call.args else None)
+
+    def visit_Assign(self, node):
+        lineno = node.lineno
+        value = node.value
+        if len(node.targets) > 1:
+            # a = b = 0: BASIC has no chained assignment, so the value is
+            # evaluated once per target. That is only safe for pure values.
+            if not all(isinstance(t, ast.Name) for t in node.targets):
+                raise TranspilerError(
+                    "Chained assignment works for plain variables only.", lineno
+                )
+            if (
+                self._list_literal(value, lineno) is not None
+                or self._input_call(value, lineno)[0]
+                or self._is_call_to(value, ("getkey", "read"))
+            ):
+                raise TranspilerError(
+                    "Chained assignment cannot take a list, input(), getkey() "
+                    "or read(); assign them one at a time.",
+                    lineno,
+                )
+        for target in node.targets:
+            self._assign_one(target, value, lineno)
+
+    def _assign_one(self, target, value, lineno):
         # xs[i] = v  ->  A(I) = v
         if isinstance(target, ast.Subscript):
-            self._emit(f"{self._subscript_expr(target)} = {self._expr(node.value)}")
+            self._emit(f"{self._subscript_expr(target)} = {self._expr(value)}")
             return
 
         if not isinstance(target, ast.Name):
-            raise TranspilerError(
-                "Only simple variable assignment supported", node.lineno
-            )
+            raise TranspilerError("Only simple variable assignment supported", lineno)
 
         py_name = target.id
-        value = node.value
 
         # xs = [0] * 10  ->  DIM A(9)
-        if self._declare_array(py_name, value, node.lineno):
+        if self._declare_array(py_name, value, lineno):
             return
 
         if py_name in self._arrays:
             raise TranspilerError(
-                f"'{py_name}' is a list; assign to its elements instead.",
-                node.lineno,
+                f"'{py_name}' is a list; assign to its elements instead.", lineno
             )
 
         # var = getkey()  ->  GET A$     var = read()  ->  READ A
-        if (
-            isinstance(value, ast.Call)
-            and isinstance(value.func, ast.Name)
-            and value.func.id in ("getkey", "read")
-        ):
+        if self._is_call_to(value, ("getkey", "read")):
             if value.args or value.keywords:
-                raise TranspilerError(
-                    f"{value.func.id}() takes no arguments.", node.lineno
-                )
+                raise TranspilerError(f"{value.func.id}() takes no arguments.", lineno)
             if value.func.id == "getkey" and py_name not in self._string_vars:
                 raise TranspilerError(
                     f"getkey() returns a string; '{py_name}' is numeric. "
                     f"Initialise it with an empty string first.",
-                    node.lineno,
+                    lineno,
                 )
             keyword = "GET" if value.func.id == "getkey" else "READ"
             self._emit(f"{keyword} {self._basic_var(py_name)}")
             return
 
-        # var = input("prompt")
-        if (
-            isinstance(value, ast.Call)
-            and isinstance(value.func, ast.Name)
-            and value.func.id == "input"
-        ):
-            prompt = self._expr(value.args[0]) if value.args else None
+        # var = input("prompt")  /  n = int(input("prompt"))
+        is_input, prompt_node = self._input_call(value, lineno)
+        if is_input:
             basic_var = self._basic_var(py_name)
-            if prompt:
-                self._emit(f"PRINT {prompt};")
+            if prompt_node is not None:
+                self._emit(f"PRINT {self._expr(prompt_node)};")
             self._emit(f"INPUT {basic_var}")
             return
 
@@ -1824,36 +2066,44 @@ class Transpiler(ast.NodeVisitor):
         self._emit(f"{basic_var} = {self._expr(value)}")
 
     def visit_AugAssign(self, node):
+        lineno = node.lineno
         if isinstance(node.target, ast.Subscript):
             basic_var = self._subscript_expr(node.target)
         elif isinstance(node.target, ast.Name):
+            if node.target.id in self._arrays:
+                raise TranspilerError(
+                    f"'{node.target.id}' is a list; BASIC cannot operate on a "
+                    f"whole array. Update its elements instead.",
+                    lineno,
+                )
             basic_var = self._basic_var(node.target.id)
         else:
             raise TranspilerError(
-                "Augmented assignment only for variables and list elements",
-                node.lineno,
+                "Augmented assignment only for variables and list elements", lineno
             )
-        rhs = self._expr(node.value)
         op = node.op
 
         if isinstance(op, ast.Mod):
+            rhs = self._expr(node.value)
             self._emit(f"{basic_var} = {self.dialect.emit_modulo(basic_var, rhs)}")
         elif isinstance(op, ast.FloorDiv):
+            rhs = self._operand(node.value, _PREC_MUL, right=True)
             self._emit(f"{basic_var} = INT({basic_var} / {rhs})")
+        elif isinstance(op, ast.BitXor):
+            self._require("has_xor", lineno, "XOR()")
+            self._emit(f"{basic_var} = XOR({basic_var}, {self._expr(node.value)})")
+        elif isinstance(op, (ast.BitAnd, ast.BitOr)):
+            word = "AND" if isinstance(op, ast.BitAnd) else "OR"
+            self._emit(f"{basic_var} = ({basic_var}) {word} ({self._expr(node.value)})")
         else:
-            op_map = {
-                ast.Add: "+",
-                ast.Sub: "-",
-                ast.Mult: "*",
-                ast.Div: "/",
-                ast.Pow: "^",
-            }
-            basic_op = op_map.get(type(op))
-            if not basic_op:
+            symbol = self.BINARY_OPS.get(type(op))
+            if not symbol:
                 raise TranspilerError(
-                    f"Unsupported augmented operator: {type(op).__name__}", node.lineno
+                    f"Unsupported augmented operator: {type(op).__name__}", lineno
                 )
-            self._emit(f"{basic_var} = {basic_var} {basic_op} {rhs}")
+            # The right-hand side binds as a unit: x *= y + 1 is x * (y + 1).
+            rhs = self._operand(node.value, _BINOP_PREC[type(op)], right=True)
+            self._emit(f"{basic_var} = {basic_var} {symbol} {rhs}")
 
     def visit_If(self, node):
         self.dialect.emit_if(node)
@@ -1996,32 +2246,33 @@ class Transpiler(ast.NodeVisitor):
 
     def visit_Import(self, node):
         for alias in node.names:
-            if alias.name not in {
-                "time",
-                "sys",
-                "math",
-                "random",
-                "py2basic_runtime",
-            }:
+            if alias.name not in self.SUPPORTED_MODULES:
                 raise TranspilerError(
                     f"import {alias.name} not supported.", node.lineno
                 )
-            if alias.name == "math":
-                self._math_aliases.add(alias.asname or "math")
-            if alias.name == "random":
-                self._random_aliases.add(alias.asname or "random")
+            self._modules[alias.asname or alias.name] = alias.name
 
     def visit_ImportFrom(self, node):
-        if node.module not in {
-            "time",
-            "sys",
-            "math",
-            "random",
-            "py2basic_runtime",
-        }:
+        if node.module not in self.SUPPORTED_MODULES:
             raise TranspilerError(
                 f"from {node.module} import ... not supported.", node.lineno
             )
+        for alias in node.names:
+            if alias.name == "*":
+                raise TranspilerError(
+                    f"from {node.module} import * is not supported; "
+                    f"name what you use.",
+                    node.lineno,
+                )
+            if node.module == "py2basic_runtime":
+                # Intrinsics are recognised by their own names.
+                if alias.asname:
+                    raise TranspilerError(
+                        f"'{alias.name}' from py2basic_runtime cannot be renamed.",
+                        node.lineno,
+                    )
+                continue
+            self._from_imports[alias.asname or alias.name] = (node.module, alias.name)
 
     def visit_Global(self, node):
         raise TranspilerError(
@@ -2035,7 +2286,7 @@ class Transpiler(ast.NodeVisitor):
         raise TranspilerError("del not supported.", node.lineno)
 
     def visit_Assert(self, node):
-        cond = self._expr(node.test)
+        cond = self._truth(node.test)
         msg = self._expr(node.msg) if node.msg else '"ASSERTION FAILED"'
         # Inline assert: reserve lines for the check, print, end
         check_ln = self.lines.next()
@@ -2141,14 +2392,23 @@ def main():
     )
 
     try:
-        t = Transpiler()
-        t.lines = LineAllocator(args.start, args.step)
-        t.dialect = dialect_cls(t)
+        t = Transpiler(dialect_cls, start=args.start, step=args.step)
         print(f"-- Dialect: {t.dialect.dialect_name()}", file=sys.stderr)
         result = t.transpile(source)
     except TranspilerError as e:
         print(f"Transpiler error: {e}", file=sys.stderr)
         sys.exit(1)
+
+    limit = t.dialect.max_line_length
+    long_lines = [ln for ln in result.splitlines() if len(ln) > limit]
+    if long_lines:
+        first = long_lines[0].split(" ", 1)[0]
+        print(
+            f"Warning: {len(long_lines)} line(s) exceed {limit} characters "
+            f"(first: line {first}). The {t.dialect.dialect_name()} screen "
+            f"editor cannot take them; load the program from a file instead.",
+            file=sys.stderr,
+        )
 
     if args.output:
         try:

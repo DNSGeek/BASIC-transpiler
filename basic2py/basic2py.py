@@ -31,7 +31,10 @@ Unresolvable GOTOs are preserved as comments with a TODO marker.
 Variable names are expanded: A->a, A$->a_str, A0->a0, A0$->a0_str
 """
 
+from __future__ import annotations
+
 import ast
+import bisect
 import re
 import sys
 import textwrap
@@ -79,7 +82,7 @@ def split_outside_strings(text: str, sep: str) -> list:
 def sub_outside_strings(pattern, repl, text: str) -> str:
     """Apply re.sub only to the parts of text outside string literals."""
     out = []
-    for i, chunk in enumerate(re.split(r'("[^"]*")', text)):
+    for i, chunk in enumerate(re.split(r'("(?:[^"\\]|\\.)*")', text)):
         # Odd indices are the captured string literals — leave them be.
         out.append(chunk if i % 2 else re.sub(pattern, repl, chunk))
     return "".join(out)
@@ -114,7 +117,7 @@ class VarMapper:
     """
 
     def __init__(self):
-        self._cache = {}
+        self._cache: dict = {}
 
     def map(self, basic_name: str, is_array: bool = False) -> str:
         key = (basic_name, is_array)
@@ -170,6 +173,18 @@ class ExprConverter:
         ("SPC", "_spc"),
     )
 
+    #: Calls whose arguments are rearranged rather than renamed. Their
+    #: arguments can hold nested calls, so a regex cannot split them.
+    STRUCTURED_CALLS: ClassVar[tuple] = (
+        "LEFT$",
+        "RIGHT$",
+        "MID$",
+        "INSTR",
+        "MOD",
+        "UPPER$",
+        "LOWER$",
+    )
+
     #: Runtime shims emitted when the program uses one of these.
     SHIMS: ClassVar[dict] = {
         "_rnd": "def _rnd(_x=1):\n    return random.random()",
@@ -182,203 +197,233 @@ class ExprConverter:
         "_spc": "def _spc(n):\n    return ' ' * int(n)",
     }
 
-    #: CHR$(34) — the BASIC idiom for a double quote inside a string.
-    _CHR34 = r"(?:CHR\$|chr)\s*\(\s*34\s*\)"
+    #: CHR$(n) calls that fold back into a Python string escape: the
+    #: double quote and the newline, which py2basic spells this way.
+    CHR_ESCAPES: ClassVar[dict] = {"34": '\\"', "13": "\\n"}
+    _CHR_CALL = r"(?:CHR\$|chr)\s*\(\s*(34|13)\s*\)"
+    #: A string literal, including any escapes the CHR$ folding produced.
+    STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 
     def __init__(self, var_mapper: VarMapper):
         self.vm = var_mapper
         #: BASIC names known to be arrays, from DIM. A(1) is a subscript,
         #: not a call, so the variable mapper has to be told the difference.
-        self.arrays = set()
+        self.arrays: set = set()
 
-    def _convert_substring(self, expr: str) -> str:
-        """LEFT$/RIGHT$/MID$ -> Python slices."""
-        expr = re.sub(
-            r"\bLEFT\$\s*\(([^,]+),\s*([^)]+)\)",
-            lambda m: f"({self.convert(m.group(1))})[:{self.convert(m.group(2))}]",
-            expr,
-            flags=re.IGNORECASE,
-        )
-        expr = re.sub(
-            r"\bRIGHT\$\s*\(([^,]+),\s*([^)]+)\)",
-            lambda m: f"({self.convert(m.group(1))})[-({self.convert(m.group(2))}):]",
-            expr,
-            flags=re.IGNORECASE,
-        )
-        # MID$(s, start, len) and the two-argument MID$(s, start).
-        expr = re.sub(
-            r"\bMID\$\s*\(([^,]+),\s*([^,)]+),\s*([^)]+)\)",
-            lambda m: (
-                f"({self.convert(m.group(1))})"
-                f"[({self.convert(m.group(2))}) - 1:"
-                f"({self.convert(m.group(2))}) - 1 + ({self.convert(m.group(3))})]"
-            ),
-            expr,
-            flags=re.IGNORECASE,
-        )
-        expr = re.sub(
-            r"\bMID\$\s*\(([^,]+),\s*([^)]+)\)",
-            lambda m: (
-                f"({self.convert(m.group(1))})" f"[({self.convert(m.group(2))}) - 1:]"
-            ),
-            expr,
-            flags=re.IGNORECASE,
-        )
-        return expr
+    # ── String literals ────────────────────────────────────────────────────
 
-    def _convert_chr34(self, expr: str) -> str:
+    @staticmethod
+    def _escape_backslashes(expr: str) -> str:
+        """A backslash is an ordinary character in BASIC; double it for Python."""
+        out = []
+        in_string = False
+        for ch in expr:
+            if ch == '"':
+                in_string = not in_string
+            elif ch == "\\" and in_string:
+                out.append("\\")
+            out.append(ch)
+        return "".join(out)
+
+    def _convert_chr(self, expr: str) -> str:
         """
-        Fold CHR$(34) concatenation back into a single Python string literal.
+        Fold CHR$(34) and CHR$(13) concatenation back into string escapes.
 
         The quote has to be *escaped* on the way in. Splicing a bare `"` in
         produces `print("say "hi")`, which is a SyntaxError rather than a
         program.
 
           "say " + CHR$(34) + "hi" + CHR$(34)  ->  "say \\"hi\\""
+          "a" + CHR$(13) + "b"                 ->  "a\\nb"
         """
+        esc = self.CHR_ESCAPES
         # Between two literals: "a" + CHR$(34) + "b"  ->  "a\"b"
         expr = re.sub(
-            rf'"\s*\+\s*{self._CHR34}\s*\+\s*"',
-            lambda _m: '\\"',
+            rf'"\s*\+\s*{self._CHR_CALL}\s*\+\s*"',
+            lambda m: esc[m.group(1)],
             expr,
             flags=re.IGNORECASE,
         )
         # Trailing: "a" + CHR$(34)  ->  "a\""
         expr = re.sub(
-            rf'"\s*\+\s*{self._CHR34}',
-            lambda _m: '\\""',
+            rf'"\s*\+\s*{self._CHR_CALL}',
+            lambda m: esc[m.group(1)] + '"',
             expr,
             flags=re.IGNORECASE,
         )
         # Leading: CHR$(34) + "a"  ->  "\"a"
         expr = re.sub(
-            rf'{self._CHR34}\s*\+\s*"',
-            lambda _m: '"\\"',
+            rf'{self._CHR_CALL}\s*\+\s*"',
+            lambda m: '"' + esc[m.group(1)],
             expr,
             flags=re.IGNORECASE,
         )
         return expr
+
+    # ── Calls with structure ───────────────────────────────────────────────
+
+    @staticmethod
+    def _matching_paren(s: str, open_idx: int) -> int:
+        """Index of the ) closing the ( at open_idx, or -1."""
+        depth = 0
+        in_string = False
+        for k in range(open_idx, len(s)):
+            ch = s[k]
+            if ch == '"':
+                in_string = not in_string
+            elif in_string:
+                continue
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return k
+        return -1
+
+    @staticmethod
+    def _split_top_level(s: str) -> list:
+        """Split an argument list on the commas outside nested parentheses."""
+        args = []
+        current: list = []
+        depth = 0
+        in_string = False
+        for ch in s:
+            if ch == '"':
+                in_string = not in_string
+            elif not in_string:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    args.append("".join(current))
+                    current = []
+                    continue
+            current.append(ch)
+        args.append("".join(current))
+        return [a.strip() for a in args if a.strip()]
+
+    def _call_pattern(self):
+        names = [re.escape(n) for n in self.STRUCTURED_CALLS]
+        names += [re.escape(n) for n in sorted(self.arrays, key=len, reverse=True)]
+        names.append(r"FN[A-Z][0-9]?")
+        # The lookbehind stops MID$( from being read as the array D$(.
+        return re.compile(r"(?<![A-Z0-9$_.])(" + "|".join(names) + r")\s*\(")
+
+    def _render_call(self, name: str, args: list):
+        """Python for one structured call, or None if the arity is wrong."""
+        n = len(args)
+        if name in self.arrays:
+            # A(3) -> a_arr[3]
+            return f"{self.vm.map(name, is_array=True)}[{', '.join(args)}]"
+        if re.fullmatch(r"FN[A-Z][0-9]?", name):
+            return f"{name.lower()}({', '.join(args)})"
+        if name == "LEFT$" and n == 2:
+            return f"({args[0]})[:{args[1]}]"
+        if name == "RIGHT$" and n == 2:
+            return f"({args[0]})[-({args[1]}):]"
+        if name == "MID$" and n == 3:
+            s, start, length = args
+            return f"({s})[({start}) - 1:({start}) - 1 + ({length})]"
+        if name == "MID$" and n == 2:
+            return f"({args[0]})[({args[1]}) - 1:]"
+        if name == "INSTR" and n == 2:
+            # INSTR is 1-based and 0 when absent; .find() is 0-based and
+            # -1, so the offset lines up exactly.
+            return f"({args[0]}).find({args[1]}) + 1"
+        if name == "INSTR" and n == 3:
+            return f"({args[0]}).find({args[1]}, ({args[2]}) - 1) + 1"
+        if name == "MOD" and n == 2:
+            return f"({args[0]}) % ({args[1]})"
+        if name == "UPPER$" and n == 1:
+            return f"({args[0]}).upper()"
+        if name == "LOWER$" and n == 1:
+            return f"({args[0]}).lower()"
+        return None
+
+    def _rewrite_calls(self, expr: str) -> str:
+        """
+        Convert every structured call, innermost first.
+
+        Each call's arguments are found by matching parentheses, not by a
+        regex, so LEFT$(S$, LEN(S$) - 1) splits where BASIC splits it.
+        """
+        pattern = self._call_pattern()
+        pos = 0
+        while True:
+            m = pattern.search(expr, pos)
+            if m is None:
+                return expr
+            open_idx = m.end() - 1
+            close_idx = self._matching_paren(expr, open_idx)
+            if close_idx < 0:
+                return expr  # unbalanced — leave the rest for the TODO scan
+            raw_args = self._split_top_level(expr[open_idx + 1 : close_idx])
+            args = [self._convert_code(a) for a in raw_args]
+            replacement = self._render_call(m.group(1), args)
+            if replacement is None:
+                pos = m.end()
+                continue
+            expr = expr[: m.start()] + replacement + expr[close_idx + 1 :]
+            pos = m.start() + len(replacement)
+
+    # ── Everything else ────────────────────────────────────────────────────
 
     def _map_vars_in_expr(self, expr: str) -> str:
         """Map BASIC variable names to Python names, avoiding function names."""
-        # Protect string literals from variable substitution
-        strings = []
-
-        def save_string(m):
-            strings.append(m.group(0))
-            return f"__STR{len(strings) - 1}__"
-
-        expr = re.sub(r'"[^"]*"', save_string, expr)
-
         # Map string vars first (A$ before A)
         expr = re.sub(r"\b([A-Z][0-9]?)\$", lambda m: self.vm.map(m.group(0)), expr)
         # Map numeric vars — but not if followed by ( (function call)
-        expr = re.sub(
-            r"\b([A-Z][0-9]?)\b(?!\s*\()",
-            lambda m: (
-                self.vm.map(m.group(0))
-                if m.group(0)
-                not in (
-                    "AND",
-                    "OR",
-                    "NOT",
-                    "TO",
-                    "STEP",
-                    "THEN",
-                    "GOTO",
-                    "GOSUB",
-                    "FOR",
-                    "NEXT",
-                    "IF",
-                    "REM",
-                    "END",
-                    "MOD",
-                )
-                else m.group(0)
-            ),
-            expr,
-        )
-
-        # Restore string literals
-        for i, s in enumerate(strings):
-            expr = expr.replace(f"__STR{i}__", s)
-
-        return expr
-
-    def _convert_arrays(self, expr: str) -> str:
-        """A(3) -> a[3] for every name that appeared in a DIM."""
-        if not self.arrays:
-            return expr
-        names = sorted(self.arrays, key=len, reverse=True)
-        pattern = r"\b(" + "|".join(re.escape(n) for n in names) + r")\s*\(([^()]*)\)"
         return re.sub(
-            pattern,
-            lambda m: (
-                f"{self.vm.map(m.group(1), is_array=True)}"
-                f"[{self.convert(m.group(2))}]"
-            ),
-            expr,
-            flags=re.IGNORECASE,
+            r"\b([A-Z][0-9]?)\b(?!\s*\()", lambda m: self.vm.map(m.group(0)), expr
         )
 
-    def convert(self, expr: str) -> str:
-        expr = expr.strip()
+    def _convert_code(self, expr: str) -> str:
+        """
+        Convert BASIC code whose string literals have been stashed.
 
-        # String concatenation: " + CHR$(34) + " patterns
-        expr = self._convert_chr34(expr)
+        The input is uppercase outside strings and the Python it produces
+        is lowercase, so no rewrite can fire twice on its own output.
+        """
+        expr = self._rewrite_calls(expr)
 
-        # Two-argument string functions, before the simple renames so the
-        # argument split still sees the original commas.
-        expr = self._convert_substring(expr)
-
-        # Simple renames. Order matters — most specific first.
+        # Simple renames.
         for basic_fn, py_fn in self.SIMPLE_FUNCTIONS:
-            expr = re.sub(rf"\b{basic_fn}\s*\(", f"{py_fn}(", expr, flags=re.IGNORECASE)
-        expr = re.sub(
-            r"\bUPPER\$\s*\(([^)]+)\)", r"(\1).upper()", expr, flags=re.IGNORECASE
-        )
-        expr = re.sub(
-            r"\bLOWER\$\s*\(([^)]+)\)", r"(\1).lower()", expr, flags=re.IGNORECASE
-        )
-        # INSTR(hay, needle) is 1-based and 0 when absent; .find() is
-        # 0-based and -1, so the offset lines up exactly.
-        expr = re.sub(
-            r"\bINSTR\s*\(([^,]+),\s*([^)]+)\)",
-            lambda m: (
-                f"({self.convert(m.group(1))}).find" f"({self.convert(m.group(2))}) + 1"
-            ),
-            expr,
-            flags=re.IGNORECASE,
-        )
-
-        # MOD(a, b) -> (a) % (b)
-        expr = re.sub(
-            r"\bMOD\s*\(([^,]+),\s*([^)]+)\)",
-            lambda m: f"({self.convert(m.group(1))}) % ({self.convert(m.group(2))})",
-            expr,
-            flags=re.IGNORECASE,
-        )
+            expr = re.sub(rf"\b{basic_fn}\s*\(", f"{py_fn}(", expr)
 
         # Operators
-        expr = re.sub(r"\^", "**", expr)
-        expr = re.sub(r"\bAND\b", "and", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bOR\b", "or", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bNOT\b", "not", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"<>", "!=", expr)
+        expr = expr.replace("^", "**")
+        expr = re.sub(r"\bAND\b", "and", expr)
+        expr = re.sub(r"\bOR\b", "or", expr)
+        expr = re.sub(r"\bNOT\b", "not", expr)
+        expr = expr.replace("<>", "!=")
 
-        # Array subscripts, before variable mapping — the mapper skips any
-        # name followed by "(", assuming it is a function call.
-        expr = self._convert_arrays(expr)
-
-        # Map variable names (after function conversion to avoid clobbering)
         expr = self._map_vars_in_expr(expr)
 
         # Clean up double negation from NOT NOT patterns
-        expr = re.sub(r"\bnot\s+not\b", "", expr)
+        return re.sub(r"\bnot\s+not\b", "", expr)
 
+    def convert(self, expr: str) -> str:
+        expr = self._escape_backslashes(expr.strip())
+        expr = self._convert_chr(expr)
+
+        # Nothing below may touch the inside of a string literal, so the
+        # literals sit out the conversion as placeholders.
+        strings = []
+
+        def stash(m):
+            strings.append(m.group(0))
+            return f"__STR{len(strings) - 1}__"
+
+        expr = self.STRING_RE.sub(stash, expr)
+        expr = self._convert_code(expr)
+        for i, s in enumerate(strings):
+            expr = expr.replace(f"__STR{i}__", s)
         return expr.strip()
 
-    def _balanced(self, s: str) -> bool:
+    @staticmethod
+    def _balanced(s: str) -> bool:
         """Check if parentheses are balanced."""
         depth = 0
         in_str = False
@@ -407,6 +452,15 @@ class ExprConverter:
         result = sub_outside_strings(r"===", "==", result)
         return result
 
+    @staticmethod
+    def negate(cond: str) -> str:
+        """`not (cond)`, or the inside of a condition that already is one."""
+        if cond.startswith("not (") and cond.endswith(")"):
+            inner = cond[5:-1]
+            if ExprConverter._balanced(inner):
+                return inner
+        return f"not ({cond})"
+
 
 # ── BASIC parser ───────────────────────────────────────────────────────────────
 
@@ -428,10 +482,13 @@ class BasicParser:
             return [text]
         if re.match(r"^\s*IF\b", upper) and not re.search(r"\bTHEN\s+BEGIN\s*$", upper):
             return [text]
+        # BASIC 7.0 spells the else branch BEND : ELSE BEGIN on one line.
+        if re.match(r"^\s*BEND\s*:?\s*ELSE\s+BEGIN\s*$", upper):
+            return [text]
         return split_outside_strings(text, ":")
 
     def parse(self, source: str) -> list:
-        lines = []
+        lines: list = []
         skipped = 0
         for raw_line in source.strip().splitlines():
             raw_line = raw_line.strip()
@@ -492,9 +549,11 @@ class CFGAnalyser:
 
     def __init__(self, lines: list):
         self.lines = lines
-        self.goto_targets = set()
-        self.gosub_targets = set()
-        self.func_names = {}  # line_number -> name
+        self.goto_targets: set = set()
+        self.gosub_targets: set = set()
+        self.func_names: dict = {}  # line_number -> name
+        #: Every line number in the program, for line_after().
+        self.numbers = sorted({ln.number for ln in lines})
 
         self._scan()
 
@@ -504,82 +563,47 @@ class CFGAnalyser:
     def func_name_at(self, line_num: int) -> str | None:
         return self.func_names.get(line_num)
 
+    def line_after(self, line_num: int) -> int | None:
+        """The number of the line following line_num in the whole program."""
+        index = bisect.bisect_right(self.numbers, line_num)
+        return self.numbers[index] if index < len(self.numbers) else None
+
 
 # ── Main transpiler ────────────────────────────────────────────────────────────
 
 
 class Transpiler:
 
-    #: Names that may legitimately survive expression conversion.
-    KNOWN_NAMES = frozenset(
-        {
-            "abs",
-            "chr",
-            "float",
-            "hex",
-            "int",
-            "len",
-            "ord",
-            "str",
-            "input",
-            "print",
-            "range",
-            "and",
-            "or",
-            "not",
-            "if",
-            "else",
-            "for",
-            "in",
-            "while",
-            "break",
-            "def",
-            "return",
-            "end",
-            "math",
-            "time",
-            "sys",
-            "random",
-            "_rnd",
-            "_sgn",
-            "_peek",
-            "_dec",
-            "_fre",
-            "_pos",
-            "_tab",
-            "_spc",
-            "_read",
-            "_restore",
-        }
-    )
-
     def __init__(self):
         self.vm = VarMapper()
         self.ec = ExprConverter(self.vm)
-        self.output_lines = []
+        self.output_lines: list = []
         self._indent = 0
         self._needs_sys = False
         self._needs_data = False
-        self._data_items = []
-        self._unknown_calls = set()
+        self._data_items: list = []
+        self._unknown_calls: set = set()
         #: Jump targets that mean break/continue inside the enclosing loop.
-        self._loop_stack = []
+        self._loop_stack: list = []
+        #: True while a subroutine body is being emitted, so RETURN means return.
+        self._in_sub = False
 
     def _flag_unknown_calls(self, text: str):
         """
         Warn about calls this converter did not recognise.
 
         Without this a BASIC function with no mapping survives as a bare
-        name — `a = PEEK(1024)` parses cleanly and then raises NameError at
-        runtime, which is worse than an honest TODO.
+        name — `a = SPRCOLOR(1)` parses cleanly and then raises NameError
+        at runtime, which is worse than an honest TODO. The parser
+        uppercases all code, and everything this converter emits is
+        lowercase, so an uppercase letter in a call name means it got
+        through untouched.
         """
-        for m in re.finditer(r"\b([A-Za-z_][A-Za-z_0-9.]*)\s*\(", text):
+        code = ExprConverter.STRING_RE.sub('""', text)
+        for m in re.finditer(r"\b([A-Za-z_][A-Za-z_0-9.$]*)\s*\(", code):
             name = m.group(1)
-            if name in self.KNOWN_NAMES or name.startswith("math."):
-                continue
-            if name.split(".")[0] in self.KNOWN_NAMES:
-                continue
-            self._unknown_calls.add(name)
+            if name != name.lower():
+                self._unknown_calls.add(name)
 
     def _emit(self, text: str = ""):
         prefix = "    " * self._indent
@@ -710,20 +734,21 @@ class Transpiler:
             self._close_block(mark)
         return i + 1
 
-    def _emit_imports(self, lines):
-        """Scan for needed imports and emit them."""
-        # Skip REM lines — prose mentioning "END" is not a statement.
+    def _emit_imports(self, lines, body: str):
+        """Emit the imports the converted program needs."""
+        # Skip REM lines — prose mentioning "SLEEP" is not a statement.
         code = [ln.text for ln in lines if not re.match(r"^REM\b", ln.text)]
         src = " ".join(code)
-        body = "\n".join(self.output_lines)
 
-        if re.search(r"\b(SQR|SIN|COS|TAN|ATN|LOG|EXP)\s*\(", src, re.IGNORECASE):
+        if re.search(r"\bmath\.", body):
             self._emit("import math")
-        if re.search(r"\b(RND|randint|random)\b", src + body, re.IGNORECASE):
+        if re.search(r"\b_rnd\(", body):
             self._emit("import random")
-        if re.search(r"\bSLEEP\b", src, re.IGNORECASE):
+        if re.search(r"\bSLEEP\b", src):
             self._emit("import time")
-        if self._needs_sys or any(re.match(r"^(END|STOP)\s*$", stmt) for stmt in code):
+        # sys is needed wherever an END or STOP was emitted, including
+        # inside a single-line IF, so it is tracked at emission time.
+        if self._needs_sys:
             self._emit("import sys")
 
     def _emit_runtime(self, body: str):
@@ -845,6 +870,12 @@ class Transpiler:
         # But be careful not to split inside strings
         parts = self._split_print_args(args)
         py_parts = [self.ec.convert(p.strip()) for p in parts if p.strip()]
+        # py2basic spells Python's default separator as an explicit " "
+        # between two strings; fold it back into print()'s own.
+        last = len(py_parts) - 1
+        py_parts = [
+            p for k, p in enumerate(py_parts) if not (p == '" "' and 0 < k < last)
+        ]
 
         # Check for trailing semicolon (no newline)
         if args.rstrip().endswith(";"):
@@ -855,23 +886,25 @@ class Transpiler:
     @staticmethod
     def _wrap_input(basic_var: str, call: str) -> str:
         """INPUT into a numeric variable reads a number, not a string."""
-        return call if basic_var.rstrip().endswith("$") else f"float({call})"
+        is_string = re.match(r"^[A-Z][0-9]?\$", basic_var.strip(), re.IGNORECASE)
+        return call if is_string else f"float({call})"
 
     def _emit_input(self, var_text: str):
-        """Convert INPUT statement."""
-        # May have a prompt: INPUT "text"; VAR
-        m = re.match(r'^"([^"]*)"\s*[;,]\s*([A-Z][0-9]?\$?)$', var_text, re.IGNORECASE)
+        """Convert INPUT [prompt;] var [, var ...]."""
+        prompt = None
+        m = re.match(r'^"([^"]*)"\s*[;,]\s*(.+)$', var_text)
         if m:
-            prompt = m.group(1)
-            basic_var = m.group(2)
-            var = self.vm.map(basic_var)
-            call = self._wrap_input(basic_var, f'input("{prompt}")')
-            self._emit(f"{var} = {call}")
-        else:
-            # Plain INPUT VAR — a preceding PRINT usually carried the prompt.
-            basic_var = var_text.strip()
-            var = self.vm.map(basic_var)
-            self._emit(f"{var} = {self._wrap_input(basic_var, 'input()')}")
+            prompt, var_text = m.group(1), m.group(2)
+        # INPUT A, B reads one value per variable; only the first input()
+        # carries the prompt, as BASIC shows it once.
+        for index, target in enumerate(split_outside_strings(var_text, ",")):
+            if prompt is not None and index == 0:
+                call = f'input("{prompt}")'
+            else:
+                call = "input()"
+            self._emit(
+                f"{self._assign_target(target)} = {self._wrap_input(target, call)}"
+            )
 
     def _emit_block(self, lines: list, cfg, i: int = 0) -> int:
         """
@@ -888,13 +921,14 @@ class Transpiler:
                 i += 1
                 continue
 
-            # REM comment — may be top of a BASIC 2.0 while loop
-            # Pattern: REM / IF NOT (cond) THEN GOTO end / body / GOTO here
+            # A later GOTO back to this line makes it the top of a loop.
+            loop_end = self._try_emit_b20_loop(lines, i, cfg)
+            if loop_end is not None:
+                i = loop_end
+                continue
+
+            # Bare REM — a blank line at top level.
             if re.match(r"^REM\s*$", text):
-                while_result = self._try_emit_b20_while(lines, i, cfg)
-                if while_result is not None:
-                    i = while_result
-                    continue
                 if self._indent == 0:
                     self._emit()
                 i += 1
@@ -918,13 +952,19 @@ class Transpiler:
 
             # RETURN
             if re.match(r"^RETURN\s*$", text):
-                # In a subroutine context just stop — def handles the return
+                # The RETURN that ends a subroutine is dropped before its
+                # body is emitted, so any that remains is an early return.
+                if self._in_sub:
+                    self._emit("return")
+                else:
+                    self._emit_todo("RETURN outside a subroutine")
                 i += 1
                 continue
 
             # END
             if re.match(r"^END\s*$", text):
                 self._emit("sys.exit()")
+                self._needs_sys = True
                 i += 1
                 continue
 
@@ -1068,20 +1108,18 @@ class Transpiler:
                 r"^IF\s+NOT\s*\((.+)\)\s+THEN\s+GOTO\s+(\d+)$", text, re.IGNORECASE
             )
             if m:
-                i = self._emit_b20_if(lines, i, m, cfg)
+                i = self._emit_b20_if(lines, i, m.group(1), int(m.group(2)), cfg)
                 continue
 
-            # IF (cond) THEN GOTO n  — assert/guard pattern
-            m = re.match(r"^IF\s+\((.+)\)\s+THEN\s+GOTO\s+(\d+)$", text, re.IGNORECASE)
+            # IF cond THEN GOTO n / IF cond THEN n — the body is skipped
+            # when the condition holds; py2basic's assert looks like this.
+            m = re.match(
+                r"^IF\s+(.+?)\s+THEN\s+(?:GOTO\s+)?(\d+)$", text, re.IGNORECASE
+            )
             if m:
-                cond = self.ec.convert_condition(m.group(1))
-                target = int(m.group(2))
-                # Simple guard — emit as pass-through
-                self._emit(f"if {cond}:")
-                self._indent += 1
-                self._emit("pass  # GOTO target resolved inline")
-                self._indent -= 1
-                i += 1
+                i = self._emit_b20_if(
+                    lines, i, m.group(1), int(m.group(2)), cfg, skip_when_true=True
+                )
                 continue
 
             # IF cond THEN statement  (single line)
@@ -1195,7 +1233,7 @@ class Transpiler:
         self._emit()
 
         # Emit subroutine definitions first (collect, emit after imports)
-        sub_lines_collected = []
+        sub_lines_collected: list = []
         saved_output = self.output_lines
         for sub_start, sub_body in subroutines:
             self.output_lines = []
@@ -1203,7 +1241,12 @@ class Transpiler:
             func_name = cfg.func_name_at(sub_start) or f"sub_{sub_start}"
             self._emit(f"def {func_name}():")
             mark = self._open_block()
+            # The closing RETURN is the def's own; any other is an early return.
+            if sub_body and re.match(r"^RETURN\s*$", sub_body[-1].text):
+                sub_body = sub_body[:-1]
+            self._in_sub = True
             self._emit_block(sub_body, cfg)
+            self._in_sub = False
             self._close_block(mark)
             self._emit()
             sub_lines_collected.extend(self.output_lines)
@@ -1221,7 +1264,7 @@ class Transpiler:
         body = "\n".join(sub_lines_collected + main_collected)
 
         # Now we know what imports and shims we need — emit them
-        self._emit_imports(lines)
+        self._emit_imports(lines, body)
         self._emit_runtime(body)
         self._emit()
 
@@ -1246,66 +1289,59 @@ class Transpiler:
             return f"line {e.lineno}: {e.msg}"
         return None
 
-    def _try_emit_b20_while(self, lines, i, cfg):
+    def _try_emit_b20_loop(self, lines, i, cfg):
         """
-        Try to detect and emit a BASIC 2.0 while loop pattern:
-            [top] REM
-            [top+1] IF NOT (cond) THEN GOTO end
-            ...body...
-            GOTO top
+        Recover a BASIC 2.0 loop whose back edge is a GOTO to line i.
+
+            [top] IF NOT (cond) THEN GOTO end      while cond:
+                  ...body...
+                  GOTO top
             [end]
-        Returns next index if pattern matched, None otherwise.
+
+            [top] IF (cond) THEN GOTO end          while not cond:
+            [top] ...body... GOTO top              while True:
+
+        The older shape with a bare REM above the IF NOT is accepted too.
+        Returns the index after the loop, or None if line i starts no loop.
         """
-        if i + 1 >= len(lines):
+        top = lines[i].number
+        back_edge = None
+        for k in range(i + 1, len(lines)):
+            m = re.match(r"^GOTO\s+(\d+)$", lines[k].text)
+            if m and int(m.group(1)) == top:
+                # The LAST jump back is the back edge; earlier ones are
+                # continues, so stopping at the first would cut the body.
+                back_edge = k
+        if back_edge is None:
             return None
+        after = cfg.line_after(lines[back_edge].number)
 
-        top_line = lines[i]
-        next_line = lines[i + 1]
+        exit_re = r"^IF\s+(NOT\s*)?\((.+)\)\s+THEN\s+GOTO\s+(\d+)$"
+        head = re.match(exit_re, lines[i].text, re.IGNORECASE)
+        body_start = i + 1
+        if not head and re.match(r"^REM\s*$", lines[i].text) and i + 1 < back_edge:
+            head = re.match(exit_re, lines[i + 1].text, re.IGNORECASE)
+            body_start = i + 2
 
-        # Next line must be IF NOT (cond) THEN GOTO n
-        m = re.match(
-            r"^IF\s+NOT\s*\((.+)\)\s+THEN\s+GOTO\s+(\d+)$",
-            next_line.text,
-            re.IGNORECASE,
-        )
-        if not m:
-            return None
+        if head and int(head.group(3)) == after:
+            cond = self.ec.convert_condition(head.group(2))
+            if not head.group(1):
+                cond = self.ec.negate(cond)
+            self._emit(f"while {cond}:")
+            body = lines[body_start:back_edge]
+        else:
+            self._emit("while True:")
+            body = lines[i:back_edge]
 
-        cond_text = m.group(1)
-        end_target = int(m.group(2))
-        top_num = top_line.number
-
-        # Collect every line up to the loop's exit target. The back edge is
-        # the LAST `GOTO top`; earlier ones are continues, so stopping at the
-        # first would truncate the body.
-        body = []
-        j = i + 2
-        while j < len(lines) and lines[j].number < end_target:
-            body.append(lines[j])
-            j += 1
-
-        if not body:
-            return None
-        back_edge = re.match(r"^GOTO\s+(\d+)$", body[-1].text)
-        if not back_edge or int(back_edge.group(1)) != top_num:
-            return None
-        body.pop()
-
-        cond = self.ec.convert_condition(cond_text)
-        # Fix = -> == in condition
-        cond = re.sub(r"(?<![!<>])=(?!=)", "==", cond)
-        cond = re.sub(r"===", "==", cond)
-
-        self._emit(f"while {cond}:")
         mark = self._open_block()
         # Jumping to the top re-tests the condition (continue); jumping to
         # the exit target leaves the loop (break).
-        self._loop_stack.append({"continue": top_num, "break": end_target})
+        self._loop_stack.append({"continue": top, "break": after})
         if body:
             self._emit_block(body, cfg)
         self._loop_stack.pop()
         self._close_block(mark)
-        return j
+        return back_edge + 1
 
     def _emit_for(self, lines, i, m, cfg):
         """Emit a FOR/NEXT loop as a Python for loop."""
@@ -1326,7 +1362,9 @@ class Transpiler:
                 break
             body.append(lines[i])
             i += 1
-        after_number = lines[i].number if i < len(lines) else None
+        # The break target is the line after NEXT in the whole program; the
+        # slice being emitted may end at the NEXT.
+        after_number = cfg.line_after(next_number) if next_number else None
 
         # BASIC's TO bound is inclusive, Python's range() stop is exclusive.
         # Which way to nudge it depends on the direction of travel: a
@@ -1403,7 +1441,7 @@ class Transpiler:
                 continue
             body.append(lines[i])
             i += 1
-        after_number = lines[i].number if i < len(lines) else None
+        after_number = cfg.line_after(loop_number) if loop_number else None
         frame = {"continue": loop_number, "break": after_number}
 
         if head is not None:
@@ -1454,7 +1492,7 @@ class Transpiler:
                 body.append(lines[i])
                 i += 1
             elif (
-                re.match(r"^BEND\s+ELSE\s+BEGIN\s*$", text, re.IGNORECASE)
+                re.match(r"^BEND\s*:?\s*ELSE\s+BEGIN\s*$", text, re.IGNORECASE)
                 and depth == 1
             ):
                 # Emit the if body, then start else
@@ -1482,51 +1520,65 @@ class Transpiler:
 
         return i
 
-    def _emit_b20_if(self, lines, i, m, cfg):
+    def _emit_b20_if(self, lines, i, cond_src, target, cfg, skip_when_true=False):
         """
-        Recover BASIC 2.0 IF NOT (cond) THEN GOTO n patterns.
+        Recover an IF that jumps past its body.
 
-        Pattern 1: Simple if (no else)
-            IF NOT (cond) THEN GOTO end
-            ...body...
-            [end line]
-
-        Pattern 2: if/else
-            IF NOT (cond) THEN GOTO else_start
-            ...body...
-            GOTO end
-            [else_start] ...else body...
+            IF NOT (cond) THEN GOTO end       if cond:
+            ...body...                            body
             [end]
-        """
-        cond = self.ec.convert_condition(m.group(1))
-        skip_target = int(m.group(2))
 
-        # Collect body lines until we hit skip_target or a GOTO
+            IF NOT (cond) THEN GOTO else      if cond:
+            ...body...                            body
+            GOTO end                          else:
+            [else] ...else body...                else body
+            [end]
+
+        skip_when_true marks the `IF cond THEN GOTO n` form, whose body runs
+        when the condition is false. When that body is a PRINT and an END it
+        is the assert py2basic emits, and when n is a landmark of the
+        enclosing loop it is a conditional break or continue.
+        """
+        cond = self.ec.convert_condition(cond_src)
+        here = lines[i].number
+
+        if skip_when_true:
+            keyword = self._loop_keyword(target)
+            if keyword:
+                self._emit(f"if {cond}:")
+                mark = self._open_block()
+                self._emit(keyword)
+                self._close_block(mark)
+                return i + 1
+            if target <= here:
+                # A jump backwards is a loop this converter did not recover.
+                self._emit(f"if {cond}:")
+                mark = self._open_block()
+                self._emit_todo(f"GOTO {target} — unresolved jump")
+                self._close_block(mark)
+                return i + 1
+            assert_end = self._try_emit_assert(lines, i + 1, target, cond)
+            if assert_end is not None:
+                return assert_end
+            cond = self.ec.negate(cond)
+
         i += 1
         body = []
-        else_body = []
-        found_skip_goto = False
-        skip_goto_target = None
-
-        while i < len(lines):
-            lnum = lines[i].number
-            text = lines[i].text
-
-            if lnum >= skip_target:
-                break
-
-            # A GOTO at the end of the body is the skip-else jump — unless
-            # it targets an enclosing loop, in which case it is a break or a
-            # continue and belongs in the body.
-            goto_m = re.match(r"^GOTO\s+(\d+)$", text)
-            if goto_m and not self._loop_keyword(int(goto_m.group(1))):
-                skip_goto_target = int(goto_m.group(1))
-                found_skip_goto = True
-                i += 1
-                break
-
+        while i < len(lines) and lines[i].number < target:
             body.append(lines[i])
             i += 1
+
+        # The skip-else jump is the body's LAST line: a GOTO past the else
+        # branch that is not a break or continue. Any earlier GOTO belongs
+        # to a nested construct.
+        else_end = None
+        if body:
+            gm = re.match(r"^GOTO\s+(\d+)$", body[-1].text)
+            if gm:
+                jump = int(gm.group(1))
+                if jump > target and not self._loop_keyword(jump):
+                    else_end = jump
+                    body.pop()
 
         self._emit(f"if {cond}:")
         mark = self._open_block()
@@ -1534,12 +1586,11 @@ class Transpiler:
             self._emit_block(body, cfg)
         self._close_block(mark)
 
-        if found_skip_goto and skip_goto_target:
-            # Collect else body: from skip_target to skip_goto_target
-            while i < len(lines) and lines[i].number < skip_goto_target:
+        if else_end is not None:
+            else_body = []
+            while i < len(lines) and lines[i].number < else_end:
                 else_body.append(lines[i])
                 i += 1
-
             if else_body:
                 self._emit("else:")
                 mark = self._open_block()
@@ -1547,6 +1598,31 @@ class Transpiler:
                 self._close_block(mark)
 
         return i
+
+    def _try_emit_assert(self, lines, i, target, cond):
+        """
+        py2basic's assert:
+
+            IF (cond) THEN GOTO n
+            PRINT "message"
+            END
+            [n]
+
+        Returns the index after the END, or None if that is not the shape.
+        """
+        if i + 1 >= len(lines) or lines[i + 1].number >= target:
+            return None
+        if i + 2 < len(lines) and lines[i + 2].number < target:
+            return None
+        print_m = re.match(r"^PRINT\s+(.+)$", lines[i].text)
+        if not print_m or not re.match(r"^END\s*$", lines[i + 1].text):
+            return None
+        message = self.ec.convert(print_m.group(1))
+        if message == '"ASSERTION FAILED"':
+            self._emit(f"assert {cond}")
+        else:
+            self._emit(f"assert {cond}, {message}")
+        return i + 2
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────

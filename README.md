@@ -7,7 +7,7 @@ and sane variable names), then run them on your system.
 
 Inspired by the idea that you shouldn't have to think in line numbers.
 
-Capable of generating BASIC 2.0 (Commodore 64 - the default), BASIC 7.0 (Commodore 128) and BASIC65 (MEGA65) dialetcs of BASIC.
+Capable of generating BASIC 2.0 (Commodore 64 - the default), BASIC 7.0 (Commodore 128) and BASIC65 (MEGA65) dialects of BASIC.
 
 ## Requirements
 
@@ -44,6 +44,7 @@ python3 transpiler.py input.py --start 100 --step 10
 x = 42          # numeric variable
 name = "hello"  # string variable (type inferred from assignment)
 x = 3.14        # float
+a = b = 0       # chained assignment: A = 0 then B = 0
 ```
 
 ### Output / Input
@@ -51,15 +52,22 @@ x = 3.14        # float
 ```python
 print("hello")           # -> PRINT "hello"
 print(x, y)              # -> PRINT X ; Y
+print("a", "b")          # -> PRINT "a" ; " " ; "b"
 print()                  # -> PRINT (blank line)
 print("a", end="")       # -> PRINT "a";      (no newline)
 print(x, y, sep="-")     # -> PRINT X ; "-" ; Y
 name = input("Name? ")   # -> PRINT "Name? "; : INPUT A$
+n = int(input("N? "))    # -> PRINT "N? "; : INPUT A      (reads a number)
 ```
 
 String literals are passed through as written — the transpiler does not
 uppercase them. `sep=` and `end=` must be plain string literals, and `end=`
 accepts only `""` or `"\n"`.
+
+Between two string arguments a `" "` is inserted so the output matches
+Python. Numbers need none: BASIC prints every number with a space on each
+side. A newline inside a string literal becomes `CHR$(13)`; a quote becomes
+`CHR$(34)`; any other control character is rejected.
 
 ### Math operators
 
@@ -71,7 +79,15 @@ x / y    # division
 x % y    # modulo    -> MOD(X, Y)
 x ** y   # power     -> X ^ Y
 x // y   # floor div -> INT(X / Y)
+x & y    # bitwise   -> (X) AND (Y)
+x | y    # bitwise   -> (X) OR (Y)
+x ^ y    # bitwise   -> XOR(X, Y)       BASIC 7.0 and 65 only
+~x       # bitwise   -> NOT (X)
 ```
+
+Parentheses are kept wherever BASIC needs them: `(a + b) * c` stays
+`(A + B) * C`, `x *= y + 1` becomes `X = X * (Y + 1)`, and `2 ** 3 ** 2`
+becomes `2 ^ (3 ^ 2)` because BASIC's `^` binds left to right.
 
 ### Augmented assignment
 
@@ -96,14 +112,19 @@ a or b   # OR
 not a    # NOT
 ```
 
+BASIC's `AND`, `OR` and `NOT` are bitwise, so a bare value in a condition
+is first compared with zero: `while n:` becomes `DO WHILE A <> 0`, `if x and
+y:` becomes `IF (A <> 0) AND (B <> 0)`, and `if not s:` on a string tests
+`A$ <> ""`. A comparison is already a proper boolean and is left alone.
+
 ### Control flow
 
 ```python
 if x > 0:          # IF X > 0 THEN BEGIN
     print("pos")   #   PRINT "POS"
-elif x < 0:        # BEND ELSE BEGIN
+elif x < 0:        # BEND : ELSE BEGIN
     print("neg")   #   IF X < 0 THEN BEGIN
-else:              #   BEND ELSE BEGIN
+else:              #   BEND : ELSE BEGIN
     print("zero")  #     PRINT "ZERO"
                    #   BEND
                    # BEND
@@ -121,7 +142,12 @@ while x < 10:   # DO WHILE X < 10
 
 `DO WHILE ... LOOP` tests the condition at the top, matching Python. (The
 `DO ... LOOP WHILE` form would be a do-while and always run the body once.)
-On BASIC 2.0 the same loop becomes a `REM` / `IF NOT ... THEN GOTO` pair.
+On BASIC 2.0 the `IF NOT ... THEN GOTO` exit test is the top of the loop and
+the target of the closing `GOTO`; `while not done:` drops the double
+negative and tests `IF (D <> 0)`.
+
+`while True:` is a bare `DO ... LOOP`, or on BASIC 2.0 a `GOTO` back to the
+first body line. Only `break` leaves it.
 
 ```python
 for i in range(5):         # FOR I = 0 TO 4
@@ -209,10 +235,11 @@ s[2:]      # MID$(S$, 3)
 s[1]       # MID$(S$, 2, 1)
 s[-1]      # MID$(S$, LEN(S$), 1)
 s[:-1]     # LEFT$(S$, LEN(S$) - 1)
+s[1:-1]    # MID$(S$, 2, LEN(S$) - 2)
 ```
 
-Slice steps (`s[::2]`) are not supported. A negative bound works only in the
-`s[-n:]` and `s[:-n]` forms.
+Slice steps (`s[::2]`) are not supported. A negative start works only as
+`s[-n:]`; a negative end works in `s[:-n]` and `s[a:-n]`.
 
 ### Lists become arrays
 
@@ -228,7 +255,8 @@ len(xs)         # folded to a literal at transpile time
 ```
 
 Arrays have a fixed size and cannot be re-assigned, sliced, or passed around
-as a whole. Constant indices are range-checked at transpile time.
+as a whole. Constant indices are range-checked at transpile time. A list of
+strings is a string array, and an element read from it is typed as a string.
 
 Note that in Commodore BASIC `A` and `A(0)` are _different_ variables, so an
 array may share a letter with a scalar. That is legal and intentional.
@@ -321,6 +349,7 @@ BASIC 2.0 has none of these and rejects them with a clear message.
 ```python
 import time
 time.sleep(1.5)   # SLEEP 1.5 on BASIC 65; a FOR/NEXT delay loop elsewhere
+time.sleep(2)     # SLEEP 2 on BASIC 65 and 7.0 (7.0 takes whole seconds)
 
 import sys
 sys.exit()        # END
@@ -329,7 +358,8 @@ import math
 math.sqrt(16)     # SQR(16)
 ```
 
-`import math as m` works too — `m.sqrt(x)` resolves the same way.
+`import math as m`, `import time as t` and `from random import randint`
+all work: a name is resolved to the module it came from.
 
 ### Comments
 
@@ -397,29 +427,54 @@ v = "text"   # error: 'v' is assigned both string and numeric values
 the transpiler stops with an error rather than emitting a line number above
 Commodore's limit of 63999.
 
+A warning on stderr names any line longer than the machine's screen editor
+accepts (80 characters on the C64, 160 on the C128 and MEGA65). Such a line
+cannot be typed in, but loads fine from a file.
+
+## Where BASIC differs from Python
+
+A program that passes under CPython can still behave a little differently
+on the Commodore. These are the known cases:
+
+- `STR$()` puts a space before a non-negative number, so `f"x={x}"` prints
+  `x= 42`. `PRINT` does the same for every number.
+- `int(x)` becomes `INT(X)`, which rounds towards minus infinity: `int(-3.7)`
+  is -3 in Python and -4 in BASIC. Use `sgn(x) * int(abs(x))` when the
+  argument can be negative.
+- `round(x)` becomes `INT(X + 0.5)`, so a tie such as `round(2.5)` rounds up
+  where Python rounds to even.
+- `x = a and b` yields one of the operands in Python and -1 or 0 in BASIC.
+  Inside `if`, `while` and `assert` the two agree.
+- In `py2basic_runtime`, `data()` has to run before `read()`; BASIC gathers
+  `DATA` statements when the program loads, wherever they sit.
+- Strings are passed through as typed. On the machine, the PETSCII character
+  set decides how lowercase letters display.
+
 ## What's NOT Supported
 
 The transpiler will give you a clear error message for any of these:
 
-- Function parameters or return values
+- Function parameters or return values, beyond the one-argument `DEF FN` form
+- Decorators, keyword-only and positional-only parameters
 - Tuples, dicts, sets (lists are supported — see Arrays)
 - Classes
 - Lambda expressions
 - List/dict/set comprehensions
 - `try`/`except`/`finally`
-- `continue` in loops
 - `with` statements
-- `import` (except `time`, `sys`, `math`)
+- `import` of anything but `time`, `sys`, `math`, `random` and
+  `py2basic_runtime`, and `from x import *`
 - `global` / `nonlocal`
-- Multiple assignment targets (`a, b = 1, 2`)
-- Chained comparisons (`1 < x < 10`)
+- Tuple unpacking (`a, b = 1, 2`)
 - Ternary expressions (`a if c else b`)
 - Nested or conditional function definitions
 - A `range()` step that is not a literal number
+- A list whose size is not a literal number
 - Reusing one variable for both strings and numbers
 - Slice steps, list slicing, and negative list indices
 - Resizing a list, or using one as a value
 - `min()` / `max()` — no BASIC equivalent
+- Tab and other control characters inside string literals
 
 f-strings and `%` formatting **are** supported, minus format specs:
 
@@ -455,23 +510,22 @@ Output (BASIC 2.0, the default dialect):
 
 ```
 10 A = 1
-20 REM
-30 IF NOT (A <= 20) THEN GOTO 180
-40 B = INT(A / 3) * 3
-50 C = INT(A / 5) * 5
-60 IF NOT ((B = A) AND (C = A)) THEN GOTO 90
-70 PRINT "FIZZBUZZ"
-80 GOTO 160
-90 IF NOT (B = A) THEN GOTO 120
-100 PRINT "FIZZ"
-110 GOTO 160
-120 IF NOT (C = A) THEN GOTO 150
-130 PRINT "BUZZ"
-140 GOTO 160
-150 PRINT A
-160 A = A + 1
-170 GOTO 20
-180 END
+20 IF NOT (A <= 20) THEN GOTO 170
+30 B = INT(A / 3) * 3
+40 C = INT(A / 5) * 5
+50 IF NOT ((B = A) AND (C = A)) THEN GOTO 80
+60 PRINT "FIZZBUZZ"
+70 GOTO 150
+80 IF NOT (B = A) THEN GOTO 110
+90 PRINT "FIZZ"
+100 GOTO 150
+110 IF NOT (C = A) THEN GOTO 140
+120 PRINT "BUZZ"
+130 GOTO 150
+140 PRINT A
+150 A = A + 1
+160 GOTO 20
+170 END
 ```
 
 ## License

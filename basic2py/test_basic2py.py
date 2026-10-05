@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from basic2py import Transpiler as BasicToPy
-from transpiler import Basic2Dialect, Basic7Dialect, Basic65Dialect
+from transpiler import Basic2Dialect, Basic7Dialect, Basic65Dialect, TranspilerError
 from transpiler import Transpiler as PyToBasic
 
 PASS = 0
@@ -83,9 +83,11 @@ def check_round_trip(name, python_source):
         ("B65", Basic65Dialect),
         ("B70", Basic7Dialect),
     ):
-        t = PyToBasic()
-        t.dialect = dialect(t)
-        basic = t.transpile(python_source)
+        try:
+            basic = PyToBasic(dialect).transpile(python_source)
+        except TranspilerError as e:
+            record(False, f"[RT {label}] {name}", f"py2basic rejected it: {e}")
+            continue
         recovered = convert(basic)
         try:
             actual = run_python(recovered)
@@ -453,6 +455,351 @@ check_round_trip(
     n = "42"
     x = int(n)
     print(x + 1)
+""",
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Expression conversion is structural, not regex-deep
+# ─────────────────────────────────────────────────────────────────────────────
+check(
+    "nested LEN inside LEFT$",
+    "10 PRINT LEFT$(S$, LEN(S$) - 1)",
+    contains=["[:len(s_str) - 1]"],
+)
+check(
+    "nested calls in MID$",
+    "10 A$ = MID$(B$, INT(X / 2), LEN(B$))",
+    contains=["[(int(x / 2)) - 1:(int(x / 2)) - 1 + (len(b_str))]"],
+)
+check(
+    "INSTR with a nested call",
+    "10 A = INSTR(B$, CHR$(65))",
+    contains=[".find(chr(65)) + 1"],
+)
+check(
+    "INSTR with a start",
+    "10 A = INSTR(B$, C$, 3)",
+    contains=[".find(c_str, (3) - 1) + 1"],
+)
+check(
+    "UPPER$ of a slice",
+    "10 A$ = UPPER$(LEFT$(B$, 2))",
+    contains=["((b_str)[:2]).upper()"],
+)
+check(
+    "MOD of nested calls",
+    "10 A = MOD(INT(B), LEN(C$))",
+    contains=["(int(b)) % (len(c_str))"],
+)
+check(
+    "LOG inside LEFT$ is not renamed twice",
+    "10 A$ = LEFT$(STR$(LOG(X)), 3)",
+    contains=["math.log(x)"],
+    absent=["math.math"],
+)
+check(
+    "array index with a call",
+    "10 DIM A(9)\n20 B = A(INT(X / 2))",
+    contains=["a_arr[int(x / 2)]"],
+)
+check(
+    "keywords inside strings are left alone",
+    '10 PRINT "A AND B ^ LEN(X) <> 1"',
+    contains=['"A AND B ^ LEN(X) <> 1"'],
+    absent=["unconverted"],
+)
+check("backslash in a string is escaped", '10 PRINT "a\\b"', contains=['"a\\\\b"'])
+check(
+    "CHR$(13) becomes a newline escape",
+    '10 PRINT "a" + CHR$(13) + "b"',
+    contains=['"a\\nb"'],
+)
+check(
+    "DEF FN call site is renamed",
+    "10 DEF FNA(X) = X * 2\n20 Y = FNA(4)",
+    contains=["y = fna(4)"],
+    absent=["FNA"],
+)
+check(
+    "GOSUB names are not flagged",
+    "10 GOSUB 30\n20 END\n30 REM -- banner\n40 PRINT 1\n50 RETURN",
+    absent=["unconverted"],
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Statements
+# ─────────────────────────────────────────────────────────────────────────────
+check(
+    "END inside IF imports sys",
+    "10 IF X = 1 THEN END",
+    contains=["import sys", "sys.exit()"],
+)
+check(
+    "separator END does not import sys",
+    "10 GOSUB 30\n20 END\n30 PRINT 1\n40 RETURN",
+    absent=["import sys"],
+)
+check(
+    "INPUT several variables",
+    "10 INPUT A, B$",
+    contains=["a = float(input())", "b_str = input()"],
+)
+check(
+    "prompted INPUT of several variables",
+    '10 INPUT "X"; A, B',
+    contains=['a = float(input("X"))', "b = float(input())"],
+)
+check(
+    "INPUT into an array element",
+    "10 DIM A(3)\n20 INPUT A(1)",
+    contains=["a_arr[1] = float(input())"],
+)
+check(
+    "print default separator folds back",
+    '10 PRINT "a" ; " " ; "b"',
+    contains=['print("a", "b")'],
+)
+check(
+    "early RETURN in a subroutine",
+    "10 GOSUB 30\n20 END\n30 IF X = 1 THEN RETURN\n40 PRINT 1\n50 RETURN",
+    contains=["return", "print(1)"],
+)
+check("RETURN outside a subroutine is a TODO", "10 RETURN", contains=["# TODO: RETURN"])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Control flow recovery
+# ─────────────────────────────────────────────────────────────────────────────
+check(
+    "IF THEN GOTO forward is a negated if",
+    '10 IF X = 1 THEN GOTO 40\n20 PRINT "no"\n30 PRINT "no2"\n40 PRINT "yes"',
+    contains=["if not (x == 1):", 'print("no")', 'print("no2")'],
+    absent=["# TODO"],
+)
+check(
+    "IF THEN line number",
+    '10 IF X = 1 THEN 30\n20 PRINT "no"\n30 PRINT "yes"',
+    contains=["if not (x == 1):"],
+)
+check(
+    "IF THEN GOTO out of a FOR is a break",
+    "10 FOR I = 1 TO 9\n20 IF I = 5 THEN GOTO 50\n30 PRINT I\n40 NEXT I\n50 PRINT 1",
+    contains=["if i == 5:", "break"],
+)
+check(
+    "IF THEN GOTO backwards is a TODO",
+    "10 PRINT 1\n20 IF X = 1 THEN GOTO 10",
+    contains=["if x == 1:", "# TODO: GOTO 10"],
+)
+check(
+    "assert is recovered",
+    '10 IF (X > 0) THEN GOTO 40\n20 PRINT "ASSERTION FAILED"\n30 END\n40 PRINT "ok"',
+    contains=["assert x > 0", 'print("ok")'],
+    absent=["sys.exit", "pass"],
+)
+check(
+    "assert with a message",
+    '10 IF (X > 0) THEN GOTO 40\n20 PRINT "bad x"\n30 END\n40 PRINT "ok"',
+    contains=['assert x > 0, "bad x"'],
+)
+check(
+    "BEND : ELSE BEGIN",
+    '10 IF X = 1 THEN BEGIN\n20 PRINT "a"\n30 BEND : ELSE BEGIN\n40 PRINT "b"\n50 BEND',
+    contains=['print("a")', "else:", 'print("b")'],
+    absent=["# TODO"],
+)
+check(
+    "BEND ELSE BEGIN without the colon",
+    '10 IF X = 1 THEN BEGIN\n20 PRINT "a"\n30 BEND ELSE BEGIN\n40 PRINT "b"\n50 BEND',
+    contains=["else:"],
+)
+check(
+    "while with the test as the loop top",
+    "10 IF NOT (X < 5) THEN GOTO 40\n20 X = X + 1\n30 GOTO 10\n40 PRINT X",
+    contains=["while x < 5:"],
+    absent=["# TODO"],
+)
+check(
+    "REM-topped while",
+    "10 REM\n20 IF NOT (X < 5) THEN GOTO 50\n30 X = X + 1\n40 GOTO 10\n50 PRINT X",
+    contains=["while x < 5:"],
+    absent=["# TODO"],
+)
+check(
+    "while not",
+    "10 IF (D <> 0) THEN GOTO 40\n20 D = 1\n30 GOTO 10\n40 PRINT D",
+    contains=["while not (d != 0):"],
+)
+check(
+    "while True",
+    "10 PRINT 1\n20 IF X = 1 THEN GOTO 40\n30 GOTO 10\n40 PRINT 2",
+    contains=["while True:", "if x == 1:", "break"],
+    absent=["# TODO"],
+)
+check(
+    "if at the top of a while True body",
+    "10 IF NOT (X = 1) THEN GOTO 30\n20 PRINT 1\n30 GOTO 10",
+    contains=["while True:", "if x == 1:"],
+)
+check(
+    "nested if/else keeps its structure",
+    "\n".join(
+        [
+            "10 IF NOT (A > 0) THEN GOTO 90",
+            "20 IF NOT (B > 0) THEN GOTO 70",
+            '30 PRINT "x"',
+            "40 GOTO 80",
+            '50 PRINT "y"',
+            '60 PRINT "y2"',
+            '70 PRINT "z"',
+            '80 PRINT "end"',
+        ]
+    ),
+    contains=["    if b > 0:", '        print("x")', '    print("z")'],
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Round trips for the fixed shapes
+# ─────────────────────────────────────────────────────────────────────────────
+check_round_trip(
+    "nested if/else inside if",
+    """
+    a = 1
+    b = 0
+    if a > 0:
+        if b > 0:
+            print("x")
+        else:
+            print("y")
+        print("z")
+    print("end")
+""",
+)
+
+check_round_trip(
+    "assert that passes",
+    """
+    x = 5
+    assert x > 0, "bad x"
+    print("ok")
+""",
+)
+
+check_round_trip(
+    "precedence",
+    """
+    a = 7
+    b = 2
+    print((a + 1) * b)
+    print(a - (b - 1))
+    print(2 ** (1 + 1))
+    print(a // (b + 1))
+    a *= b + 1
+    print(a)
+""",
+)
+
+check_round_trip(
+    "truthiness of bare values",
+    """
+    n = 3
+    while n:
+        print(n)
+        n -= 1
+    x = 5
+    y = 2
+    if x and y:
+        print("both")
+    if not x:
+        print("zero")
+    else:
+        print("nonzero")
+""",
+)
+
+check_round_trip(
+    "while not",
+    """
+    done = 0
+    n = 0
+    while not done:
+        n += 1
+        if n == 3:
+            done = 1
+    print(n)
+""",
+)
+
+check_round_trip(
+    "string list",
+    """
+    names = ["ann", "bob"]
+    first = names[0]
+    print(first)
+    print(names[1])
+""",
+)
+
+check_round_trip(
+    "string with a newline and a quote",
+    """
+    print("a\\nb")
+    print("say \\"hi\\"")
+""",
+)
+
+check_round_trip(
+    "print spacing between strings",
+    """
+    print("Hello,", "world")
+    x = 5
+    print("x =", x)
+""",
+)
+
+check_round_trip(
+    "chained assignment and while True",
+    """
+    a = b = 0
+    while True:
+        a += 1
+        if a == 3:
+            break
+    print(a + b)
+""",
+)
+
+check_round_trip(
+    "early return from a subroutine",
+    """
+    x = 1
+    def check():
+        if x == 1:
+            print("one")
+            return
+        print("other")
+    check()
+""",
+)
+
+check_round_trip(
+    "break from a loop that ends an if body",
+    """
+    x = 1
+    if x == 1:
+        for i in range(5):
+            if i == 2:
+                break
+            print(i)
+    print("done")
+""",
+)
+
+check_round_trip(
+    "slice to the end but one",
+    """
+    s = "hello"
+    print(s[:-1])
+    print(s[1:-1])
 """,
 )
 

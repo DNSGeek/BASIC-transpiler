@@ -145,7 +145,7 @@ test(
 test(
     "B20 while",
     "i=0\nwhile i<10:\n i+=1",
-    ["REM", "IF NOT (A < 10) THEN GOTO", "GOTO"],
+    ["IF NOT (A < 10) THEN GOTO", "GOTO"],
     basic65=False,
 )
 
@@ -177,14 +177,14 @@ test(
 test(
     "B65 if/else",
     "x=5\nif x>0:\n print('y')\nelse:\n print('n')",
-    ["IF A > 0 THEN BEGIN", "BEND ELSE BEGIN", "BEND"],
+    ["IF A > 0 THEN BEGIN", "BEND : ELSE BEGIN", "BEND"],
     basic65=True,
 )
 
 test(
     "B65 elif",
     "x=5\nif x>10:\n print('b')\nelif x>5:\n print('m')\nelse:\n print('s')",
-    ["IF A > 10 THEN BEGIN", "BEND ELSE BEGIN", "BEND"],
+    ["IF A > 10 THEN BEGIN", "BEND : ELSE BEGIN", "BEND"],
     basic65=True,
 )
 
@@ -258,11 +258,11 @@ def test7(name, source, expected=None, should_fail=False):
 
 # Structured like B65
 test7("if only", "x=5\nif x>3:\n print('big')", ["IF A > 3 THEN BEGIN", "BEND"])
-test7("if/else", "x=5\nif x>0:\n print('y')\nelse:\n print('n')", ["BEND ELSE BEGIN"])
+test7("if/else", "x=5\nif x>0:\n print('y')\nelse:\n print('n')", ["BEND : ELSE BEGIN"])
 test7(
     "elif",
     "x=5\nif x>10:\n print('b')\nelif x>5:\n print('m')\nelse:\n print('s')",
-    ["IF A > 10 THEN BEGIN", "BEND ELSE BEGIN"],
+    ["IF A > 10 THEN BEGIN", "BEND : ELSE BEGIN"],
 )
 test7("while", "i=0\nwhile i<10:\n i+=1", ["DO WHILE A < 10", "LOOP"])
 test7("break", "i=0\nwhile i<100:\n if i==5:\n  break\n i+=1", ["EXIT"])
@@ -271,8 +271,8 @@ test7("break", "i=0\nwhile i<100:\n if i==5:\n  break\n i+=1", ["EXIT"])
 test7("modulo", "x = 7 % 3", ["- INT("])
 test7("aug mod", "x=7\nx%=3", ["- INT("])
 
-# No SLEEP like B20
-test7("sleep becomes a delay loop", "import time\ntime.sleep(1)", ["FOR ", "NEXT "])
+# SLEEP exists, but takes whole seconds only
+test7("whole-second sleep uses SLEEP", "import time\ntime.sleep(1)", ["SLEEP 1"])
 
 # Shared basics still work
 test7("for loop", "for i in range(5):\n print(i)", ["FOR", "= 0 TO 4", "NEXT"])
@@ -929,6 +929,405 @@ check(
 )
 check("hex rejected on B20", "x = hex(255)", dialect="B20", should_fail=True)
 check_all("int with base 8 rejected", 'n = "77"\nx = int(n, 8)', should_fail=True)
+
+
+def check_eq(name, actual, expected):
+    global PASS, FAIL
+    if actual == expected:
+        print(f"PASS {name}")
+        PASS += 1
+    else:
+        print(f"FAIL {name}: {actual!r} != {expected!r}")
+        FAIL += 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Operator precedence survives the trip
+# ─────────────────────────────────────────────────────────────────────────────
+check_all("parenthesised sum times", "x = (1 + 2) * 3", contains=["(1 + 2) * 3"])
+check_all(
+    "nested subtraction", "a=1\nb=2\nc=3\nx = a - (b - c)", contains=["A - (B - C)"]
+)
+check_all(
+    "left-nested needs no parens",
+    "a=1\nb=2\nc=3\nx = a - b - c",
+    contains=["A - B - C"],
+    absent=["("],
+)
+check_all("power of a sum", "x = 2 ** (3 + 1)", contains=["2 ^ (3 + 1)"])
+check_all("power is right-associative", "x = 2 ** 3 ** 2", contains=["2 ^ (3 ^ 2)"])
+check_all("negative base", "x = (-2) ** 2", contains=["(-2) ^ 2"])
+check_all(
+    "floor division of a sum",
+    "x=7\ny=1\nz = x // (y + 1)",
+    contains=["INT(A / (B + 1))"],
+)
+check_all(
+    "aug mult binds the right side",
+    "x=2\ny=3\nx *= y + 1",
+    contains=["A = A * (B + 1)"],
+)
+check_all(
+    "aug sub binds the right side", "x=2\ny=3\nx -= y - 1", contains=["A = A - (B - 1)"]
+)
+check_all(
+    "aug floordiv binds the right side",
+    "x=7\ny=1\nx //= y + 1",
+    contains=["A = INT(A / (B + 1))"],
+)
+check(
+    "modulo of a sum on B20",
+    "x=5\ny = (x + 1) % 3",
+    dialect="B20",
+    contains=["(A + 1) - INT((A + 1) / 3) * 3"],
+)
+check(
+    "modulo of a sum on B65",
+    "x=5\ny = (x + 1) % 3",
+    dialect="B65",
+    contains=["MOD(A + 1, 3)"],
+)
+check(
+    "modulo times two on B20",
+    "x=5\ny = (x % 3) * 2",
+    dialect="B20",
+    contains=["(A - INT(A / 3) * 3) * 2"],
+)
+check(
+    "modulo times two on B65",
+    "x=5\ny = (x % 3) * 2",
+    dialect="B65",
+    contains=["MOD(A, 3) * 2"],
+)
+check_all(
+    "comparison of a sum", "a=1\nb=2\nif a + b == 3:\n print(1)", contains=["A + B = 3"]
+)
+check_all(
+    "DEF FN body keeps its parens",
+    "def f(x):\n return (x + 1) * 2\ny = f(3)",
+    contains=["= (A + 1) * 2"],
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conditions are proper booleans: BASIC's AND/OR/NOT are bitwise
+# ─────────────────────────────────────────────────────────────────────────────
+check(
+    "while on a bare number tests nonzero",
+    "n=3\nwhile n:\n n -= 1",
+    dialect="B20",
+    contains=["IF NOT (A <> 0) THEN GOTO"],
+)
+check(
+    "while on a bare number on B65",
+    "n=3\nwhile n:\n n -= 1",
+    dialect="B65",
+    contains=["DO WHILE A <> 0"],
+)
+check_all(
+    "and on bare numbers",
+    "x=5\ny=2\nif x and y:\n print(1)",
+    contains=["(A <> 0) AND (B <> 0)"],
+)
+check_all("not on a bare number", "x=5\nif not x:\n print(1)", contains=["(A <> 0)"])
+check_all(
+    "not on a string tests empty", 's=""\nif not s:\n print(1)', contains=['(A$ <> "")']
+)
+check_all(
+    "comparisons need no coercion",
+    "x=5\nif x > 3 and x < 9:\n print(1)",
+    contains=["(A > 3) AND (A < 9)"],
+    absent=["<> 0"],
+)
+check_all(
+    "sum in a condition",
+    "x=5\ny=1\nif x + y:\n print(1)",
+    contains=["A + B <> 0"],
+)
+check(
+    "while not drops the double negative",
+    "d=0\nwhile not d:\n d=1",
+    dialect="B20",
+    contains=["IF (A <> 0) THEN GOTO"],
+    absent=["NOT"],
+)
+check(
+    "if not drops the double negative",
+    "x=5\nif not x > 3:\n print(1)",
+    dialect="B20",
+    contains=["IF (A > 3) THEN GOTO"],
+    absent=["NOT"],
+)
+check_all("assert on a bare number", "x=5\nassert x", contains=["(A <> 0)"])
+check_all(
+    "while True has no exit test",
+    "while True:\n break",
+    absent=["IF", "WHILE", "-1", "REM"],
+)
+check(
+    "while True is a bare DO on B65",
+    "while True:\n break",
+    dialect="B65",
+    contains=["10 DO\n", "EXIT", "LOOP"],
+)
+check(
+    "while True continue jumps to the first body line",
+    "x=0\nwhile True:\n x += 1\n if x < 3:\n  continue\n break",
+    dialect="B20",
+    contains=["GOTO 20"],
+)
+check(
+    "B20 while has no REM line",
+    "i=0\nwhile i<3:\n i+=1",
+    dialect="B20",
+    contains=["20 IF NOT (A < 3) THEN GOTO 50", "40 GOTO 20"],
+    absent=["REM"],
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# String typing reaches lists, f-strings and % formatting
+# ─────────────────────────────────────────────────────────────────────────────
+check_all(
+    "string list element is a string",
+    'names=["a","b"]\nn=names[0]\nprint(n)',
+    contains=["A$ = A$(0)"],
+    absent=["A = A$(0)"],
+)
+check_all(
+    "string fill list element is a string",
+    'names=[""]*3\nnames[0]="x"\nn=names[0]\nprint(n)',
+    contains=["A$ = A$(0)"],
+)
+check_all(
+    "string list element in a concatenation",
+    'names=["a"]\ns="x" + names[0]\nprint(s)',
+    contains=['A$ = "x" + A$(0)'],
+)
+check_all(
+    "fstring with a slice",
+    's="hello"\nprint(f"{s[:3]}")',
+    contains=["PRINT LEFT$(A$, 3)"],
+    absent=["STR$(LEFT$"],
+)
+check_all(
+    "percent with str()",
+    'x=5\nprint("%s" % str(x))',
+    contains=["PRINT STR$(A)"],
+    absent=["STR$(STR$"],
+)
+check(
+    "fstring with upper",
+    's="hi"\nprint(f"{s.upper()}")',
+    dialect="B65",
+    contains=["PRINT UPPER$(A$)"],
+    absent=["STR$("],
+)
+check_all(
+    "fstring with a concatenation",
+    'a="x"\nprint(f"{a + a}")',
+    contains=["PRINT A$ + A$"],
+    absent=["STR$("],
+)
+check_all(
+    "newline in a string becomes CHR$(13)",
+    'print("a\\nb")',
+    contains=['"a" + CHR$(13) + "b"'],
+)
+check_all("tab in a string rejected", 'print("a\\tb")', should_fail=True)
+check_all(
+    "slice with a negative end",
+    's="hello"\nt=s[1:-1]\nprint(t)',
+    contains=["MID$(A$, 2, LEN(A$) - 2)"],
+)
+check_all(
+    "slice with a variable start and negative end",
+    's="hello"\ni=1\nt=s[i:-1]\nprint(t)',
+    contains=["MID$(A$, A + 1, LEN(A$) - 1 - A)"],
+)
+check_all("list size must be a literal", "n=3\nxs=[0]*n", should_fail=True)
+check_all("repeating a longer list rejected", "xs=[1, 2]*3", should_fail=True)
+check_all(
+    "augmented assignment to a list rejected", "xs=[0]*3\nxs += 1", should_fail=True
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Function shapes that are not subroutines are refused, not misread
+# ─────────────────────────────────────────────────────────────────────────────
+check_all(
+    "keyword-only parameter rejected",
+    "def f(*, a):\n print(a)\nf(a=1)",
+    should_fail=True,
+)
+check_all(
+    "positional-only parameter rejected",
+    "def f(a, /):\n print(a)\nf(1)",
+    should_fail=True,
+)
+check_all(
+    "decorator rejected", "@staticmethod\ndef f():\n print(1)\nf()", should_fail=True
+)
+check_all(
+    "decorated DEF FN candidate rejected",
+    "@staticmethod\ndef f(x):\n return x * 2\ny = f(1)",
+    should_fail=True,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dialect syntax
+# ─────────────────────────────────────────────────────────────────────────────
+for d in ("B65", "B70"):
+    check(
+        "else follows BEND after a colon",
+        "x=1\nif x:\n print(1)\nelse:\n print(2)",
+        dialect=d,
+        contains=["BEND : ELSE BEGIN"],
+        absent=["BEND ELSE"],
+    )
+    check("xor is a function", "x = 5 ^ 3", dialect=d, contains=["XOR(5, 3)"])
+    check("aug xor", "x=5\nx ^= 1", dialect=d, contains=["A = XOR(A, 1)"])
+    check("xor as an operand", "x = (5 ^ 3) + 1", dialect=d, contains=["XOR(5, 3) + 1"])
+check("xor rejected on B20", "x = 5 ^ 3", dialect="B20", should_fail=True)
+check_all("bitwise and", "x = 5 & 3", contains=["(5) AND (3)"])
+check_all(
+    "bitwise and as an operand", "x = (5 & 3) + 1", contains=["((5) AND (3)) + 1"]
+)
+check_all("invert", "x=5\ny = ~x", contains=["NOT (A)"])
+check(
+    "whole seconds use SLEEP on B70",
+    "import time\ntime.sleep(2)",
+    dialect="B70",
+    contains=["SLEEP 2"],
+    absent=["FOR "],
+)
+check(
+    "fractional seconds loop on B70",
+    "import time\ntime.sleep(0.5)",
+    dialect="B70",
+    contains=["TO 500"],
+    absent=["SLEEP"],
+)
+check(
+    "runtime seconds loop on B70",
+    "import time\nn=2\ntime.sleep(n)",
+    dialect="B70",
+    contains=["(A) * 1000"],
+    absent=["SLEEP"],
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Input, chained assignment, imports, print spacing
+# ─────────────────────────────────────────────────────────────────────────────
+check_all(
+    "int(input()) reads a number",
+    'n = int(input("N? "))\nprint(n)',
+    contains=['PRINT "N? ";', "INPUT A", "PRINT A"],
+    absent=["INPUT A$"],
+)
+check_all(
+    "float(input()) reads a number",
+    "n = float(input())\nprint(n)",
+    contains=["10 INPUT A\n"],
+)
+check_all("plain input is a string", "s = input()\nprint(s)", contains=["INPUT A$"])
+check_all(
+    "int(input()) in an expression still rejected",
+    "n = int(input()) + 1",
+    should_fail=True,
+)
+check_all("chained assignment", "a = b = 0\nprint(a + b)", contains=["A = 0", "B = 0"])
+check_all(
+    "chained assignment of a string",
+    'a = b = "x"\nprint(a + b)',
+    contains=['A$ = "x"', 'B$ = "x"'],
+)
+check_all("chained assignment with input rejected", "a = b = input()", should_fail=True)
+check_all(
+    "chained assignment with a list rejected", "a = b = [0] * 3", should_fail=True
+)
+check_all(
+    "from random import",
+    "from random import randint\nx = randint(1, 6)",
+    contains=["INT(RND(1) * (6 - 1 + 1)) + 1"],
+)
+check_all(
+    "from random import seed",
+    "from random import seed\nseed(3)",
+    contains=["RND(-ABS(3))"],
+)
+check_all("random alias", "import random as r\nx = r.random()", contains=["RND(1)"])
+check("time alias", "import time as t\nt.sleep(1)", dialect="B65", contains=["SLEEP 1"])
+check(
+    "from time import sleep",
+    "from time import sleep\nsleep(1)",
+    dialect="B65",
+    contains=["SLEEP 1"],
+)
+check_all("sys alias", "import sys as s\ns.exit()", contains=["END"])
+check_all("from sys import exit", "from sys import exit\nexit()", contains=["END"])
+check_all(
+    "from math import sqrt",
+    "from math import sqrt as root\nx = root(4)",
+    contains=["SQR(4)"],
+)
+check_all("star import rejected", "from math import *\nx = sqrt(4)", should_fail=True)
+check_all(
+    "renamed intrinsic rejected",
+    "from py2basic_runtime import poke as p\np(1, 2)",
+    should_fail=True,
+)
+check_all(
+    "module-qualified intrinsic",
+    "import py2basic_runtime\npy2basic_runtime.poke(1, 2)",
+    contains=["POKE 1, 2"],
+)
+check_all(
+    "statement in expression rejected",
+    "import time\nx = time.sleep(1)",
+    should_fail=True,
+)
+check_all("quit ends the program", "quit()", contains=["END"])
+check_all(
+    "print separates two strings",
+    'print("Hello,", "world")',
+    contains=['PRINT "Hello," ; " " ; "world"'],
+)
+check_all(
+    "print string then number",
+    'x=5\nprint("x =", x)',
+    contains=['PRINT "x =" ; A'],
+    absent=['" "'],
+)
+check_all(
+    "print two numbers",
+    "x=5\nprint(x, x)",
+    contains=["PRINT A ; A"],
+    absent=['" "'],
+)
+check_all(
+    "print explicit empty sep",
+    'print("a", "b", sep="")',
+    contains=['PRINT "a" ; "b"'],
+    absent=['" "'],
+)
+check_all(
+    "print explicit sep",
+    'print("a", "b", sep="-")',
+    contains=['PRINT "a" ; "-" ; "b"'],
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constructor
+# ─────────────────────────────────────────────────────────────────────────────
+check_eq(
+    "dialect class and numbering via the constructor",
+    Transpiler(Basic65Dialect, start=100, step=5).transpile("x = 1\ny = 2"),
+    "100 A = 1\n105 B = 2",
+)
+check_eq(
+    "dialect name via the constructor",
+    Transpiler(Basic7Dialect).dialect.dialect_name(),
+    "BASIC 7.0",
+)
+check_eq("default dialect", Transpiler().dialect.dialect_name(), "BASIC 2.0")
 
 print(f"\n{'=' * 50}")
 print(f"Results: {PASS} passed, {FAIL} failed")

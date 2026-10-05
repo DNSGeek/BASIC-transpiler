@@ -20,7 +20,6 @@ effect on anything real. SYS is a no-op. These are stubs for testing
 control flow, not an emulator.
 """
 
-import random as _random
 import sys as _sys
 
 __all__ = [
@@ -42,9 +41,10 @@ __all__ = [
 ]
 
 #: Stand-in for the machine's address space. POKE/PEEK round-trip through it.
-_MEMORY = {}
+_MEMORY: dict = {}
 
-_DATA = []
+#: The READ queue. Unlike BASIC's DATA, data() has to run before read().
+_DATA: list = []
 _DATA_POS = 0
 
 
@@ -128,7 +128,3 @@ def basic(statement):
     Nothing to execute locally, so it just reports what would be emitted.
     """
     print(f"[basic] {statement}", file=_sys.stderr)
-
-
-def _seed(value):
-    _random.seed(value)

@@ -40,11 +40,16 @@ through all three dialects, comparing program _output_ rather than source.
 | `DO` / `LOOP WHILE cond`      | `while True:` + trailing `break` (bottom-tested) |
 | `EXIT`                        | `break`                                          |
 | `IF NOT (cond) THEN GOTO n`   | `if cond:` / `if/else`                           |
+| `IF cond THEN GOTO n`         | `if not cond:`, or `break` / `continue`          |
+| `IF (c) THEN GOTO` + PRINT + END | `assert c, "message"`                         |
+| `GOTO` back to an earlier line | `while cond:` / `while True:`                   |
 | `IF cond THEN BEGIN` / `BEND` | `if cond:` / `if/else`                           |
+| `BEND : ELSE BEGIN`           | `else:`                                          |
 | `GOSUB n` / `RETURN`          | `def func():` / `func()`                         |
 | `PRINT a ; b`                 | `print(a, b)`                                    |
 | `INPUT a_str`                 | `a_str = input()`                                |
 | `INPUT a` (numeric)           | `a = float(input())`                             |
+| `INPUT "p"; a, b`             | one `input()` per variable                       |
 | `REM text`                    | `# text`                                         |
 | `END`                         | `sys.exit()`                                     |
 | `SLEEP n`                     | `time.sleep(n)`                                  |
@@ -60,6 +65,8 @@ through all three dialects, comparing program _output_ rather than source.
 | `x ^ y`                       | `x ** y`                                         |
 | `x <> y`                      | `x != y`                                         |
 | `CHR$(34)` concatenation      | Restored to an escaped `\"` in the string        |
+| `CHR$(13)` concatenation      | Restored to a `\n` in the string                 |
+| `RETURN` before the end       | `return`                                         |
 | `A = 1 : B = 2`               | Split into separate statements                   |
 | `NEXT` with no variable       | Closes the innermost `FOR`                       |
 | `LEFT$(s,n)` / `RIGHT$(s,n)`  | `s[:n]` / `s[-n:]`                               |
@@ -107,6 +114,12 @@ Function names are recovered from `REM -- name` comments
 - Lines with no line number are skipped with a warning on stderr.
 - `GOTO`s that jump to the enclosing loop's `NEXT`/`LOOP`, or past its end,
   are recovered as `continue` and `break`.
+- A line that a later `GOTO` jumps back to is the top of a loop. If it is an
+  `IF ... THEN GOTO` whose target is the line after that `GOTO`, the loop is
+  `while cond:`; otherwise it is `while True:`.
+- Function arguments are split by matching parentheses, so
+  `LEFT$(S$, LEN(S$) - 1)` converts correctly however deeply it nests.
+- Nothing inside a string literal is rewritten; `"A AND B"` stays as it is.
 - Only the runtime shims a program actually uses are emitted.
 
 ## Runtime shims
