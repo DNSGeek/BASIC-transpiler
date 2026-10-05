@@ -162,7 +162,7 @@ cleanup.
 
 ## Example round-trip
 
-```
+```text
 Python → py2basic → BASIC 2.0 → basic2py → Python
 ```
 
