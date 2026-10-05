@@ -7,7 +7,8 @@ and sane variable names), then run them on your system.
 
 Inspired by the idea that you shouldn't have to think in line numbers.
 
-Capable of generating BASIC 2.0 (Commodore 64 - the default), BASIC 7.0 (Commodore 128) and BASIC65 (MEGA65) dialects of BASIC.
+Capable of generating BASIC 2.0 (Commodore 64 - the default), BASIC 7.0
+(Commodore 128) and BASIC65 (MEGA65) dialects of BASIC.
 
 ## Requirements
 
@@ -390,7 +391,7 @@ The transpiler maintains a symbol table that maps Python names to BASIC names:
 
 Use `--vars` to see the full mapping:
 
-```
+```text
 $ python3 transpiler.py myprog.py --vars
 
 10 A = 0
@@ -508,7 +509,7 @@ while i <= 20:
 
 Output (BASIC 2.0, the default dialect):
 
-```
+```text
 10 A = 1
 20 IF NOT (A <= 20) THEN GOTO 170
 30 B = INT(A / 3) * 3
